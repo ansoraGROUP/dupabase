@@ -1,5 +1,5 @@
-# Binaries
-server
+# Binaries (compiled Go output at repo root only)
+/server
 *.exe
 *.dll
 *.so
@@ -38,6 +38,7 @@ dashboard/out/
 
 # Docker
 .deploy/local/.env
+.deploy/prod/.env
 
 # Screenshots
 *.png

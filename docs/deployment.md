@@ -46,11 +46,11 @@ curl -fsSL https://get.docker.com | sh
 git clone https://github.com/ansoraGROUP/dupabase.git
 cd dupabase
 
-# Configure
-cp .deploy/local/.env.example .deploy/local/.env
+# Configure production environment
+cp .deploy/prod/.env.example .deploy/prod/.env
 ```
 
-Edit `.deploy/local/.env`:
+Edit `.deploy/prod/.env`:
 
 ```bash
 DATABASE_URL=postgresql://dupabase:your-secure-password@host.docker.internal:5432/dupabase
@@ -58,12 +58,21 @@ PLATFORM_JWT_SECRET=$(openssl rand -base64 48)
 SITE_URL=https://your-domain.com
 ADMIN_EMAIL=admin@your-domain.com
 ADMIN_PASSWORD=your-admin-password
+ALLOWED_ORIGINS=https://your-domain.com
+```
+
+Encrypt and commit (so CI/CD can deploy):
+
+```bash
+make encrypt ENV=prod
+git add .deploy/prod/.env.encrypted
+git commit -m "Add encrypted production env"
 ```
 
 Build and start:
 
 ```bash
-make build && make up
+make prod-build && make prod-up
 ```
 
 Dupabase is now running on port 3333 (internal). Next, set up a reverse proxy for HTTPS.
@@ -260,12 +269,55 @@ Caddy automatically obtains and renews SSL certificates.
 - [ ] `HOST=127.0.0.1` (only accept connections from reverse proxy)
 - [ ] Regular PostgreSQL backups configured (see [Backup & Import](backup-and-import.md))
 
+## CI/CD with GitHub Actions
+
+Dupabase includes a GitHub Actions workflow for automated deployments.
+
+### Setup
+
+1. **Encrypt your production env**:
+
+```bash
+cp .deploy/prod/.env.example .deploy/prod/.env
+# Edit with real values
+make encrypt ENV=prod
+git add .deploy/prod/.env.encrypted
+git commit -m "Add encrypted production env"
+```
+
+2. **Add GitHub secrets** (Settings → Secrets → Actions):
+
+| Secret | Description |
+|--------|-------------|
+| `ENCRYPTION_KEY` | Password used with `make encrypt` |
+| `DEPLOY_HOST` | Server IP or hostname |
+| `DEPLOY_USER` | SSH user (e.g., `root`) |
+| `DEPLOY_SSH_KEY` | Private SSH key for the server |
+| `DEPLOY_PATH` | Path to the repo on server (e.g., `/opt/dupabase`) |
+
+3. **Push to main** — the workflow builds, pushes to GHCR, and deploys to your server.
+
+### Manual encrypt/decrypt
+
+```bash
+# Encrypt (interactive password prompt)
+make encrypt ENV=prod
+
+# Decrypt (interactive)
+make decrypt ENV=prod
+
+# Non-interactive (for CI)
+ENCRYPTION_KEY=your-secret make decrypt ENV=prod
+```
+
+---
+
 ## Updating Dupabase
 
 ```bash
 cd dupabase
 git pull
-make build && make restart
+make prod-build && make prod-restart
 ```
 
 Or for manual deployments:

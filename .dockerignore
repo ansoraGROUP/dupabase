@@ -1,6 +1,7 @@
 # Dependencies
 node_modules/
 dashboard/node_modules/
+dashboard/.next/
 
 # Build artifacts
 *.exe
@@ -22,16 +23,18 @@ tests/
 .git/
 .gitignore
 
-# Docker
-.deploy/
+# Docker (exclude local env, keep shared)
+.deploy/local/
 docker-compose*.yaml
-Dockerfile
 
 # Env files
+.env
 .env.production
 .env.local
+.env.*.local
 
 # Misc
-README.md
-*.md
 tmp/
+docs/
+*.png
+.playwright-mcp/
