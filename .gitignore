@@ -1,0 +1,46 @@
+# Binaries
+server
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Environment files
+.env
+.env.local
+.env.production
+.env.*.local
+
+# Dependencies
+node_modules/
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+/tmp/
+*.test
+*.out
+*.prof
+
+# Next.js
+dashboard/.next/
+dashboard/out/
+
+# Docker
+.deploy/local/.env
+
+# Screenshots
+*.png
+
+# Playwright MCP
+.playwright-mcp/

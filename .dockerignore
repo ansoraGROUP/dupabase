@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+dashboard/node_modules/
+
+# Build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test
+tests/
+*.test
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Docker
+.deploy/
+docker-compose*.yaml
+Dockerfile
+
+# Env files
+.env.production
+.env.local
+
+# Misc
+README.md
+*.md
+tmp/
