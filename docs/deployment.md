@@ -269,44 +269,68 @@ Caddy automatically obtains and renews SSL certificates.
 - [ ] `HOST=127.0.0.1` (only accept connections from reverse proxy)
 - [ ] Regular PostgreSQL backups configured (see [Backup & Import](backup-and-import.md))
 
-## CI/CD with GitHub Actions
+## CI/CD with GitHub Actions + Watchtower
 
-Dupabase includes a GitHub Actions workflow for automated deployments.
+Dupabase uses GitHub Actions to build and push Docker images to GHCR, then triggers [Watchtower](https://containrrr.dev/watchtower/) to auto-update the running container.
 
-### Setup
+### How it works
 
-1. **Encrypt your production env**:
+1. Push to `main` → GitHub Actions builds the image and pushes to GHCR
+2. Actions sends a curl request to Watchtower on your server
+3. Watchtower pulls the new image and recreates the container
 
-```bash
-cp .deploy/prod/.env.example .deploy/prod/.env
-# Edit with real values
-make encrypt ENV=prod
-git add .deploy/prod/.env.encrypted
-git commit -m "Add encrypted production env"
+### Server setup
+
+On your production server, set up Watchtower:
+
+```yaml
+# watchtower docker-compose.yaml
+services:
+  watchtower:
+    image: containrrr/watchtower
+    container_name: watchtower
+    environment:
+      - WATCHTOWER_HTTP_API_TOKEN=your-watchtower-token
+      - WATCHTOWER_HTTP_API_UPDATE=true
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_LABEL_ENABLE=true
+    ports:
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ~/.docker/config.json:/config.json:ro
+    command: --http-api-update --label-enable
+    restart: unless-stopped
 ```
 
-2. **Add GitHub secrets** (Settings → Secrets → Actions):
+Then configure and start Dupabase:
+
+```bash
+git clone https://github.com/ansoraGROUP/dupabase.git
+cd dupabase
+cp .deploy/prod/.env.example .deploy/prod/.env
+# Edit .deploy/prod/.env with your values
+docker compose -f .deploy/prod/docker-compose.yaml up -d
+```
+
+### GitHub secrets
+
+Add these in Settings → Secrets → Actions:
 
 | Secret | Description |
 |--------|-------------|
-| `ENCRYPTION_KEY` | Password used with `make encrypt` |
-| `DEPLOY_HOST` | Server IP or hostname |
-| `DEPLOY_USER` | SSH user (e.g., `root`) |
-| `DEPLOY_SSH_KEY` | Private SSH key for the server |
-| `DEPLOY_PATH` | Path to the repo on server (e.g., `/opt/dupabase`) |
+| `WATCHTOWER_URL` | Watchtower endpoint (e.g., `http://your-server:8080`) |
+| `WATCHTOWER_TOKEN` | Watchtower HTTP API token |
 
-3. **Push to main** — the workflow builds, pushes to GHCR, and deploys to your server.
+`GITHUB_TOKEN` is provided automatically for GHCR access.
 
-### Manual encrypt/decrypt
+### Encrypt / Decrypt env files
 
 ```bash
-# Encrypt (interactive password prompt)
-make encrypt ENV=prod
+# Encrypt
+ENCRYPTION_KEY=your-secret make encrypt ENV=prod
 
-# Decrypt (interactive)
-make decrypt ENV=prod
-
-# Non-interactive (for CI)
+# Decrypt
 ENCRYPTION_KEY=your-secret make decrypt ENV=prod
 ```
 
@@ -314,13 +338,16 @@ ENCRYPTION_KEY=your-secret make decrypt ENV=prod
 
 ## Updating Dupabase
 
+With Watchtower, updates are automatic on push to `main`.
+
+For manual updates:
+
 ```bash
-cd dupabase
-git pull
-make prod-build && make prod-restart
+docker compose -f .deploy/prod/docker-compose.yaml pull
+docker compose -f .deploy/prod/docker-compose.yaml up -d
 ```
 
-Or for manual deployments:
+Or without Docker:
 
 ```bash
 git pull

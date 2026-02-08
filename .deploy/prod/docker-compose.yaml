@@ -1,8 +1,6 @@
 services:
   dupabase:
-    build:
-      context: ../..
-      dockerfile: .deploy/_shared/Dockerfile
+    image: ghcr.io/ansoragroup/dupabase:prod-latest
     container_name: dupabase
     ports:
       - "${DUPABASE_PORT:-3333}:3333"
@@ -24,6 +22,8 @@ services:
       ADMIN_PASSWORD: "${ADMIN_PASSWORD}"
       ALLOWED_ORIGINS: "${ALLOWED_ORIGINS}"
       BACKUP_ENCRYPTION_KEY: "${BACKUP_ENCRYPTION_KEY:-}"
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     networks:
       - ansora_network
     restart: unless-stopped
