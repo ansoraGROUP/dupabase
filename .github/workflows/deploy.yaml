@@ -7,7 +7,6 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build-and-push:
@@ -19,6 +18,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set image name to lowercase
+        id: meta
+        run: echo "image_name=${GITHUB_REPOSITORY,,}" >> $GITHUB_OUTPUT
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -37,8 +40,8 @@ jobs:
           file: .deploy/_shared/Dockerfile
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prod-latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prod-${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ steps.meta.outputs.image_name }}:prod-latest
+            ${{ env.REGISTRY }}/${{ steps.meta.outputs.image_name }}:prod-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
