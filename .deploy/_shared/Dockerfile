@@ -30,8 +30,6 @@ FROM node:20-alpine
 
 RUN apk --no-cache add ca-certificates tzdata postgresql16-client
 
-RUN adduser -D -u 1000 appuser
-
 WORKDIR /app
 
 # Go binary and migrations
@@ -49,6 +47,6 @@ RUN chmod +x entrypoint.sh
 
 EXPOSE 3333
 
-USER appuser
+USER node
 
 CMD ["./entrypoint.sh"]
