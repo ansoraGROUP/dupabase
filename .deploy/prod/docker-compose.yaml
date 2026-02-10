@@ -22,6 +22,8 @@ services:
       ADMIN_PASSWORD: "${ADMIN_PASSWORD}"
       ALLOWED_ORIGINS: "${ALLOWED_ORIGINS}"
       BACKUP_ENCRYPTION_KEY: "${BACKUP_ENCRYPTION_KEY:-}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
     networks:

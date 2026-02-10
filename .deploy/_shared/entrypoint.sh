@@ -3,7 +3,7 @@ set -e
 
 # Start Next.js dashboard in the background (port 3000 internal)
 cd /app/dashboard
-PORT=3000 node server.js &
+HOSTNAME=0.0.0.0 PORT=3000 node server.js &
 NEXT_PID=$!
 
 # Wait briefly for Next.js to start
