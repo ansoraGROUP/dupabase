@@ -726,11 +726,15 @@ func cors(next http.Handler) http.Handler {
 		w.Header().Set("Vary", "Origin")
 
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", strings.Join([]string{
-			"Authorization", "Content-Type", "apikey", "X-Client-Info",
-			"X-Supabase-Api-Version", "Accept", "Accept-Profile", "Content-Profile",
-			"Prefer", "Range", "telegram_init_data", "telegram_env",
-		}, ", "))
+
+		// Reflect whatever headers the client requests — Dupabase shouldn't
+		// need to know about every custom header upstream apps decide to send.
+		if reqHeaders := r.Header.Get("Access-Control-Request-Headers"); reqHeaders != "" {
+			w.Header().Set("Access-Control-Allow-Headers", reqHeaders)
+		} else {
+			w.Header().Set("Access-Control-Allow-Headers", "*")
+		}
+
 		w.Header().Set("Access-Control-Expose-Headers", "Content-Range, X-Total-Count")
 		w.Header().Set("Access-Control-Max-Age", "86400")
 
