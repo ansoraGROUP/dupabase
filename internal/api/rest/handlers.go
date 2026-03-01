@@ -26,6 +26,7 @@ func NewHandler() *Handler {
 
 // HandleTable handles all CRUD operations on /rest/v1/{table}
 func (h *Handler) HandleTable(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[REST-DEBUG] HandleTable: %s %s (query: %s)", r.Method, r.URL.Path, r.URL.RawQuery)
 	project := middleware.GetProject(r)
 	pool := middleware.GetProjectSQL(r)
 	if project == nil || pool == nil {
@@ -145,6 +146,7 @@ func (h *Handler) handleSelect(ctx context.Context, w http.ResponseWriter, r *ht
 
 	// Parse select parameter for columns and embedded resources
 	selectParam := q.Get("select")
+	log.Printf("[REST-DEBUG] handleSelect: table=%s, select=%q", table, selectParam)
 	cols, embeds := parseSelectWithEmbedding(selectParam)
 
 	// Build WHERE clause from filters
