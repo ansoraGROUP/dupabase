@@ -142,11 +142,9 @@ func (h *Handler) HandleRPC(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleSelect(ctx context.Context, w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, role string, claims map[string]interface{}, schema, table string) {
 	q := r.URL.Query()
 
-	// Build SELECT clause
-	selectCols := "*"
-	if s := q.Get("select"); s != "" {
-		selectCols = buildSelectClause(s)
-	}
+	// Parse select parameter for columns and embedded resources
+	selectParam := q.Get("select")
+	cols, embeds := parseSelectWithEmbedding(selectParam)
 
 	// Build WHERE clause from filters
 	where, whereArgs := buildWhereClause(q, schema, table)
@@ -181,33 +179,114 @@ func (h *Handler) handleSelect(ctx context.Context, w http.ResponseWriter, r *ht
 		}
 	}
 
-	query := fmt.Sprintf(`SELECT %s FROM %s.%s%s%s%s`,
-		selectCols, quoteIdent(schema), quoteIdent(table), where, orderBy, limitOffset)
-
 	// Check for count preference
 	prefer := parsePrefer(r.Header.Get("Prefer"))
 	wantCount := prefer["count"] != ""
 
-	result, err := database.ExecuteWithRLS(ctx, pool, role, database.JWTClaims(claims), func(tx pgx.Tx) (interface{}, error) {
-		rows, err := tx.Query(ctx, query, whereArgs...)
-		if err != nil {
-			return nil, err
-		}
-		data, err := collectRows(rows)
-		if err != nil {
-			return nil, err
-		}
+	var result interface{}
+	var err error
 
-		if wantCount {
-			countQuery := fmt.Sprintf(`SELECT COUNT(*) FROM %s.%s%s`,
-				quoteIdent(schema), quoteIdent(table), where)
-			var total int
-			tx.QueryRow(ctx, countQuery, whereArgs...).Scan(&total)
-			w.Header().Set("Content-Range", fmt.Sprintf("0-%d/%d", len(data.([]map[string]interface{}))-1, total))
-		}
+	if len(embeds) == 0 {
+		// No embeddings — simple query (original fast path)
+		selectCols := strings.Join(cols, ", ")
+		query := fmt.Sprintf(`SELECT %s FROM %s.%s%s%s%s`,
+			selectCols, quoteIdent(schema), quoteIdent(table), where, orderBy, limitOffset)
 
-		return data, nil
-	})
+		result, err = database.ExecuteWithRLS(ctx, pool, role, database.JWTClaims(claims), func(tx pgx.Tx) (interface{}, error) {
+			rows, err := tx.Query(ctx, query, whereArgs...)
+			if err != nil {
+				return nil, err
+			}
+			data, err := collectRows(rows)
+			if err != nil {
+				return nil, err
+			}
+			if wantCount {
+				countQuery := fmt.Sprintf(`SELECT COUNT(*) FROM %s.%s%s`,
+					quoteIdent(schema), quoteIdent(table), where)
+				var total int
+				tx.QueryRow(ctx, countQuery, whereArgs...).Scan(&total)
+				w.Header().Set("Content-Range", fmt.Sprintf("0-%d/%d", len(data.([]map[string]interface{}))-1, total))
+			}
+			return data, nil
+		})
+	} else {
+		// Has embeddings — look up FKs and build complex query inside transaction
+		result, err = database.ExecuteWithRLS(ctx, pool, role, database.JWTClaims(claims), func(tx pgx.Tx) (interface{}, error) {
+			selectParts := make([]string, len(cols))
+			copy(selectParts, cols)
+			var joinClauses []string
+
+			for _, embed := range embeds {
+				// Try forward FK: main table has FK to embedded table
+				fk, fkErr := lookupFK(ctx, tx, schema, table, embed.table)
+				if fkErr == nil {
+					// M:1 embedding — use correlated subquery
+					embCols := make([]string, len(embed.columns))
+					for i, c := range embed.columns {
+						embCols[i] = quoteIdent(c)
+					}
+					subquery := fmt.Sprintf(
+						`(SELECT row_to_json(x) FROM (SELECT %s FROM %s.%s WHERE %s = %s.%s LIMIT 1) x) AS %s`,
+						strings.Join(embCols, ", "),
+						quoteIdent(schema), quoteIdent(embed.table),
+						quoteIdent(fk.toCol),
+						quoteIdent(table), quoteIdent(fk.fromCol),
+						quoteIdent(embed.alias),
+					)
+					selectParts = append(selectParts, subquery)
+				} else {
+					// Try reverse FK: embedded table has FK to main table
+					fk, fkErr = lookupFK(ctx, tx, schema, embed.table, table)
+					if fkErr != nil {
+						return nil, fmt.Errorf("no foreign key between %s and %s", table, embed.table)
+					}
+					if embed.isInner {
+						joinClauses = append(joinClauses, fmt.Sprintf(
+							` INNER JOIN %s.%s ON %s.%s = %s.%s`,
+							quoteIdent(schema), quoteIdent(embed.table),
+							quoteIdent(embed.table), quoteIdent(fk.fromCol),
+							quoteIdent(table), quoteIdent(fk.toCol),
+						))
+					} else {
+						joinClauses = append(joinClauses, fmt.Sprintf(
+							` LEFT JOIN %s.%s ON %s.%s = %s.%s`,
+							quoteIdent(schema), quoteIdent(embed.table),
+							quoteIdent(embed.table), quoteIdent(fk.fromCol),
+							quoteIdent(table), quoteIdent(fk.toCol),
+						))
+					}
+				}
+			}
+
+			query := fmt.Sprintf(`SELECT %s FROM %s.%s%s%s%s%s`,
+				strings.Join(selectParts, ", "),
+				quoteIdent(schema), quoteIdent(table),
+				strings.Join(joinClauses, ""),
+				where, orderBy, limitOffset,
+			)
+
+			rows, qErr := tx.Query(ctx, query, whereArgs...)
+			if qErr != nil {
+				return nil, qErr
+			}
+			data, cErr := collectRows(rows)
+			if cErr != nil {
+				return nil, cErr
+			}
+
+			if wantCount {
+				countQuery := fmt.Sprintf(`SELECT COUNT(*) FROM %s.%s%s%s`,
+					quoteIdent(schema), quoteIdent(table),
+					strings.Join(joinClauses, ""), where)
+				var total int
+				tx.QueryRow(ctx, countQuery, whereArgs...).Scan(&total)
+				w.Header().Set("Content-Range", fmt.Sprintf("0-%d/%d", len(data.([]map[string]interface{}))-1, total))
+			}
+			return data, nil
+		})
+	}
+
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "PGRST102", sanitizeDBError(err))
 		return
@@ -264,6 +343,26 @@ func (h *Handler) handleInsert(ctx context.Context, w http.ResponseWriter, r *ht
 	columns := make([]string, 0)
 	for k := range records[0] {
 		columns = append(columns, k)
+	}
+
+	// Support PostgREST ?columns= parameter to restrict which columns are used
+	if colsParam := r.URL.Query().Get("columns"); colsParam != "" {
+		allowedCols := make(map[string]bool)
+		for _, c := range strings.Split(colsParam, ",") {
+			c = strings.Trim(c, `"' `)
+			if c != "" {
+				allowedCols[c] = true
+			}
+		}
+		var filteredCols []string
+		for _, c := range columns {
+			if allowedCols[c] {
+				filteredCols = append(filteredCols, c)
+			}
+		}
+		if len(filteredCols) > 0 {
+			columns = filteredCols
+		}
 	}
 
 	// Build VALUES placeholders
@@ -325,6 +424,9 @@ func (h *Handler) handleInsert(ctx context.Context, w http.ResponseWriter, r *ht
 				}
 				if len(setClauses) > 0 {
 					query += fmt.Sprintf(" ON CONFLICT (%s) DO UPDATE SET %s", strings.Join(quotedConflict, ", "), strings.Join(setClauses, ", "))
+				} else {
+					// All columns are conflict columns — nothing to update, just do nothing
+					query += fmt.Sprintf(" ON CONFLICT (%s) DO NOTHING", strings.Join(quotedConflict, ", "))
 				}
 			}
 		}
@@ -466,19 +568,105 @@ func (h *Handler) handleDelete(ctx context.Context, w http.ResponseWriter, r *ht
 
 // ---------- Query building helpers ----------
 
-func buildSelectClause(selectParam string) string {
+// embeddedResource represents a PostgREST resource embedding in the select clause
+type embeddedResource struct {
+	alias   string   // display name (e.g., "category")
+	table   string   // related table (e.g., "categories")
+	columns []string // columns to select from related table
+	isInner bool     // true for !inner modifier
+}
+
+// fkRelation describes a foreign key relationship between two tables
+type fkRelation struct {
+	fromCol   string
+	toCol     string
+	fromTable string
+	toTable   string
+}
+
+// splitRespectingParens splits by commas but not inside parentheses
+func splitRespectingParens(s string) []string {
+	var parts []string
+	depth := 0
+	start := 0
+	for i, c := range s {
+		switch c {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				parts = append(parts, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+	if start <= len(s) {
+		parts = append(parts, s[start:])
+	}
+	return parts
+}
+
+// parseSelectWithEmbedding parses the select parameter extracting columns and embedded resources
+func parseSelectWithEmbedding(selectParam string) ([]string, []embeddedResource) {
 	selectParam = strings.TrimSpace(selectParam)
 	if selectParam == "" {
-		return "*"
+		return []string{"*"}, nil
 	}
-	parts := strings.Split(selectParam, ",")
+
+	parts := splitRespectingParens(selectParam)
 	var cols []string
+	var embeds []embeddedResource
+
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
 		if p == "*" {
 			cols = append(cols, "*")
 			continue
 		}
+
+		// Check for embedding: contains ( and ends with )
+		parenIdx := strings.Index(p, "(")
+		if parenIdx > 0 && strings.HasSuffix(p, ")") {
+			inner := p[parenIdx+1 : len(p)-1]
+			prefix := p[:parenIdx]
+
+			embed := embeddedResource{}
+
+			// Check for !inner modifier
+			if bangIdx := strings.Index(prefix, "!"); bangIdx > 0 {
+				modifier := prefix[bangIdx+1:]
+				prefix = prefix[:bangIdx]
+				if modifier == "inner" {
+					embed.isInner = true
+				}
+			}
+
+			// Check for alias:table
+			if colonIdx := strings.Index(prefix, ":"); colonIdx > 0 {
+				embed.alias = prefix[:colonIdx]
+				embed.table = prefix[colonIdx+1:]
+			} else {
+				embed.table = prefix
+				embed.alias = prefix
+			}
+
+			// Parse inner columns
+			for _, c := range strings.Split(inner, ",") {
+				c = strings.TrimSpace(c)
+				if c != "" {
+					embed.columns = append(embed.columns, c)
+				}
+			}
+
+			embeds = append(embeds, embed)
+			continue
+		}
+
 		// Handle alias: alias:column
 		if idx := strings.Index(p, ":"); idx > 0 {
 			alias := strings.TrimSpace(p[:idx])
@@ -486,21 +674,49 @@ func buildSelectClause(selectParam string) string {
 			cols = append(cols, fmt.Sprintf("%s AS %s", quoteIdent(col), quoteIdent(alias)))
 			continue
 		}
-		// Skip relationship queries for now (e.g., "table(col)")
-		if strings.Contains(p, "(") {
-			continue
-		}
+
 		cols = append(cols, quoteIdent(p))
 	}
+
 	if len(cols) == 0 {
-		return "*"
+		cols = []string{"*"}
 	}
+
+	return cols, embeds
+}
+
+// buildSelectClause builds a simple SQL SELECT clause (no embeddings)
+func buildSelectClause(selectParam string) string {
+	cols, _ := parseSelectWithEmbedding(selectParam)
 	return strings.Join(cols, ", ")
+}
+
+// lookupFK finds a foreign key from fromTable to toTable in the given schema
+func lookupFK(ctx context.Context, tx pgx.Tx, schema, fromTable, toTable string) (*fkRelation, error) {
+	query := `
+		SELECT kcu.column_name, ccu.column_name
+		FROM information_schema.table_constraints tc
+		JOIN information_schema.key_column_usage kcu
+			ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+		JOIN information_schema.constraint_column_usage ccu
+			ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema
+		WHERE tc.constraint_type = 'FOREIGN KEY'
+			AND tc.table_schema = $1
+			AND tc.table_name = $2
+			AND ccu.table_name = $3
+		LIMIT 1
+	`
+	var fromCol, toCol string
+	err := tx.QueryRow(ctx, query, schema, fromTable, toTable).Scan(&fromCol, &toCol)
+	if err != nil {
+		return nil, err
+	}
+	return &fkRelation{fromCol: fromCol, toCol: toCol, fromTable: fromTable, toTable: toTable}, nil
 }
 
 func buildWhereClause(q map[string][]string, schema, table string) (string, []interface{}) {
 	// Reserved params that are not filters
-	reserved := map[string]bool{"select": true, "order": true, "limit": true, "offset": true, "on_conflict": true}
+	reserved := map[string]bool{"select": true, "order": true, "limit": true, "offset": true, "on_conflict": true, "columns": true}
 
 	var conditions []string
 	var args []interface{}
@@ -532,8 +748,16 @@ func buildWhereClause(q map[string][]string, schema, table string) (string, []in
 	return " WHERE " + strings.Join(conditions, " AND "), args
 }
 
+// quoteIdentDotted handles table.column notation (e.g., "user_categories.user_id")
+func quoteIdentDotted(s string) string {
+	if dotIdx := strings.Index(s, "."); dotIdx > 0 {
+		return quoteIdent(s[:dotIdx]) + "." + quoteIdent(s[dotIdx+1:])
+	}
+	return quoteIdent(s)
+}
+
 func parseFilter(column, value string, argIdx int) (string, []interface{}, int) {
-	col := quoteIdent(column)
+	col := quoteIdentDotted(column)
 
 	// Handle negation
 	negate := false
@@ -812,6 +1036,15 @@ func convertPgValue(v interface{}) interface{} {
 		return s
 	case time.Time:
 		return val.Format(time.RFC3339Nano)
+	case []byte:
+		// JSON/JSONB data from PostgreSQL (e.g., row_to_json results)
+		if len(val) > 0 && (val[0] == '{' || val[0] == '[' || val[0] == '"') {
+			var parsed interface{}
+			if json.Unmarshal(val, &parsed) == nil {
+				return parsed
+			}
+		}
+		return string(val)
 	case []interface{}:
 		result := make([]interface{}, len(val))
 		for i, item := range val {
