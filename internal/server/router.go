@@ -729,7 +729,7 @@ func cors(next http.Handler) http.Handler {
 		w.Header().Set("Access-Control-Allow-Headers", strings.Join([]string{
 			"Authorization", "Content-Type", "apikey", "X-Client-Info",
 			"X-Supabase-Api-Version", "Accept", "Accept-Profile", "Content-Profile",
-			"Prefer", "Range", "telegram_init_data",
+			"Prefer", "Range", "telegram_init_data", "telegram_env",
 		}, ", "))
 		w.Header().Set("Access-Control-Expose-Headers", "Content-Range, X-Total-Count")
 		w.Header().Set("Access-Control-Max-Age", "86400")
