@@ -93,4 +93,4 @@ jobs:
       - name: Trigger Watchtower
         run: |
           curl -H "Authorization: Bearer ${{ secrets.WATCHTOWER_TOKEN }}" \
-               --location --request POST ${{ secrets.WATCHTOWER_URL }}/v1/update
+               --location --request POST ${{ secrets.WATCHTOWER_ENDPOINT }}/v1/update
