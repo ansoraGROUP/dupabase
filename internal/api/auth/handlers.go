@@ -242,40 +242,43 @@ func (h *Handler) Signup(w http.ResponseWriter, r *http.Request) {
 }
 
 // signupAnonymous creates an anonymous user session (Supabase signInAnonymously).
+// Matches real Supabase GoTrue: NULL email, empty app_metadata, no identity rows,
+// NULL confirmed_at, amr method "anonymous", is_anonymous claim in JWT.
 func (h *Handler) signupAnonymous(ctx context.Context, w http.ResponseWriter, r *http.Request, project *database.ProjectRecord, pool *pgxpool.Pool, data map[string]interface{}, now time.Time) {
 	userMetadata := data
 	if userMetadata == nil {
 		userMetadata = map[string]interface{}{}
 	}
-	appMetadata := map[string]interface{}{"provider": "anonymous", "providers": []string{"anonymous"}}
+	// Real Supabase: app_metadata is empty {} for anonymous users (no provider/providers)
+	appMetadata := map[string]interface{}{}
 	userMetaJSON, _ := json.Marshal(userMetadata)
 	appMetaJSON, _ := json.Marshal(appMetadata)
 
-	// Insert anonymous user (no email, no password, is_anonymous = true)
-	// email must be NULL (not empty string) to avoid unique constraint violations
+	// Insert anonymous user: email=NULL (not ''), no password, is_anonymous=true
+	// NULL emails don't violate unique constraints in PostgreSQL
+	// confirmed_at and email_confirmed_at are NULL (anonymous users are not "confirmed")
 	var userID string
 	var createdAt, updatedAt time.Time
 	err := pool.QueryRow(ctx, `
-		INSERT INTO auth.users (encrypted_password, email_confirmed_at,
+		INSERT INTO auth.users (encrypted_password,
 			raw_app_meta_data, raw_user_meta_data, aud, role, is_anonymous, last_sign_in_at)
-		VALUES ('', $1, $2, $3, 'authenticated', 'authenticated', true, $1)
+		VALUES ('', $1, $2, 'authenticated', 'authenticated', true, $3)
 		RETURNING id, created_at, updated_at
-	`, now, string(appMetaJSON), string(userMetaJSON),
+	`, string(appMetaJSON), string(userMetaJSON), now,
 	).Scan(&userID, &createdAt, &updatedAt)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create anonymous user")
 		return
 	}
 
-	// Create session
-	session, err := createSession(ctx, pool, project, userID, "", userMetadata, appMetadata, r)
+	// Create session (pass isAnonymous=true for correct JWT claims)
+	session, err := createSessionAnonymous(ctx, pool, project, userID, userMetadata, appMetadata, r)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create session")
 		return
 	}
 
 	lastSignIn := now.Format(time.RFC3339)
-	confirmedAt := now.Format(time.RFC3339)
 
 	resp := sessionResponse{
 		AccessToken:  session.accessToken,
@@ -290,7 +293,7 @@ func (h *Handler) signupAnonymous(ctx context.Context, w http.ResponseWriter, r 
 			Email:            "",
 			EmailConfirmedAt: nil,
 			Phone:            "",
-			ConfirmedAt:      &confirmedAt,
+			ConfirmedAt:      nil, // anonymous users have NULL confirmed_at
 			LastSignInAt:     &lastSignIn,
 			AppMetadata:      appMetadata,
 			UserMetadata:     userMetadata,
@@ -663,6 +666,44 @@ type sessionData struct {
 	expiresAt    int64
 }
 
+func createSessionAnonymous(ctx contextType, pool *pgxpool.Pool, project *database.ProjectRecord, userID string, userMeta, appMeta map[string]interface{}, r *http.Request) (*sessionData, error) {
+	var sessionID string
+	userAgent := r.Header.Get("User-Agent")
+	ip := r.RemoteAddr
+	err := pool.QueryRow(ctx, `
+		INSERT INTO auth.sessions (user_id, user_agent, ip, aal)
+		VALUES ($1, $2, $3, 'aal1')
+		RETURNING id
+	`, userID, userAgent, ip).Scan(&sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("create session: %w", err)
+	}
+
+	accessToken, expiresAt, err := generateUserJWTFull(project.JWTSecret, project.SiteURL, userID, "", userMeta, appMeta, sessionID, true, "anonymous")
+	if err != nil {
+		return nil, fmt.Errorf("generate jwt: %w", err)
+	}
+
+	refreshToken, err := generateRefreshToken()
+	if err != nil {
+		return nil, fmt.Errorf("generate refresh token: %w", err)
+	}
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO auth.refresh_tokens (token, user_id, session_id)
+		VALUES ($1, $2, $3)
+	`, refreshToken, userID, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("store refresh token: %w", err)
+	}
+
+	return &sessionData{
+		accessToken:  accessToken,
+		refreshToken: refreshToken,
+		expiresAt:    expiresAt,
+	}, nil
+}
+
 func createSession(ctx contextType, pool *pgxpool.Pool, project *database.ProjectRecord, userID, email string, userMeta, appMeta map[string]interface{}, r *http.Request) (*sessionData, error) {
 	// Create session record
 	var sessionID string
@@ -706,6 +747,10 @@ func createSession(ctx contextType, pool *pgxpool.Pool, project *database.Projec
 }
 
 func generateUserJWT(jwtSecret, siteURL, userID, email string, userMeta, appMeta map[string]interface{}, sessionID string) (string, int64, error) {
+	return generateUserJWTFull(jwtSecret, siteURL, userID, email, userMeta, appMeta, sessionID, false, "password")
+}
+
+func generateUserJWTFull(jwtSecret, siteURL, userID, email string, userMeta, appMeta map[string]interface{}, sessionID string, isAnonymous bool, amrMethod string) (string, int64, error) {
 	now := time.Now()
 	expiresAt := now.Add(1 * time.Hour).Unix()
 
@@ -721,8 +766,9 @@ func generateUserJWT(jwtSecret, siteURL, userID, email string, userMeta, appMeta
 		"user_metadata": userMeta,
 		"role":          "authenticated",
 		"aal":           "aal1",
-		"amr":           []map[string]interface{}{{"method": "password", "timestamp": now.Unix()}},
+		"amr":           []map[string]interface{}{{"method": amrMethod, "timestamp": now.Unix()}},
 		"session_id":    sessionID,
+		"is_anonymous":  isAnonymous,
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
