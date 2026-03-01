@@ -211,61 +211,69 @@ func (h *Handler) handleSelect(ctx context.Context, w http.ResponseWriter, r *ht
 			return data, nil
 		})
 	} else {
-		// Has embeddings — look up FKs and build complex query inside transaction
-		result, err = database.ExecuteWithRLS(ctx, pool, role, database.JWTClaims(claims), func(tx pgx.Tx) (interface{}, error) {
-			selectParts := make([]string, len(cols))
-			copy(selectParts, cols)
-			var joinClauses []string
+		// Has embeddings — look up FKs BEFORE entering RLS transaction
+		// (information_schema may not be visible to anon/authenticated roles)
+		selectParts := make([]string, len(cols))
+		copy(selectParts, cols)
+		var joinClauses []string
+		var fkErr error
 
-			for _, embed := range embeds {
-				// Try forward FK: main table has FK to embedded table
-				fk, fkErr := lookupFK(ctx, tx, schema, table, embed.table)
-				if fkErr == nil {
-					// M:1 embedding — use correlated subquery
-					embCols := make([]string, len(embed.columns))
-					for i, c := range embed.columns {
-						embCols[i] = quoteIdent(c)
-					}
-					subquery := fmt.Sprintf(
-						`(SELECT row_to_json(x) FROM (SELECT %s FROM %s.%s WHERE %s = %s.%s LIMIT 1) x) AS %s`,
-						strings.Join(embCols, ", "),
+		for _, embed := range embeds {
+			// Try forward FK: main table has FK to embedded table
+			fk, err2 := lookupFK(ctx, pool, schema, table, embed.table)
+			if err2 == nil {
+				// M:1 embedding — use correlated subquery
+				embCols := make([]string, len(embed.columns))
+				for i, c := range embed.columns {
+					embCols[i] = quoteIdent(c)
+				}
+				subquery := fmt.Sprintf(
+					`(SELECT row_to_json(x) FROM (SELECT %s FROM %s.%s WHERE %s = %s.%s LIMIT 1) x) AS %s`,
+					strings.Join(embCols, ", "),
+					quoteIdent(schema), quoteIdent(embed.table),
+					quoteIdent(fk.toCol),
+					quoteIdent(table), quoteIdent(fk.fromCol),
+					quoteIdent(embed.alias),
+				)
+				selectParts = append(selectParts, subquery)
+			} else {
+				// Try reverse FK: embedded table has FK to main table
+				fk, err2 = lookupFK(ctx, pool, schema, embed.table, table)
+				if err2 != nil {
+					fkErr = fmt.Errorf("no foreign key between %s and %s", table, embed.table)
+					break
+				}
+				if embed.isInner {
+					joinClauses = append(joinClauses, fmt.Sprintf(
+						` INNER JOIN %s.%s ON %s.%s = %s.%s`,
 						quoteIdent(schema), quoteIdent(embed.table),
-						quoteIdent(fk.toCol),
-						quoteIdent(table), quoteIdent(fk.fromCol),
-						quoteIdent(embed.alias),
-					)
-					selectParts = append(selectParts, subquery)
+						quoteIdent(embed.table), quoteIdent(fk.fromCol),
+						quoteIdent(table), quoteIdent(fk.toCol),
+					))
 				} else {
-					// Try reverse FK: embedded table has FK to main table
-					fk, fkErr = lookupFK(ctx, tx, schema, embed.table, table)
-					if fkErr != nil {
-						return nil, fmt.Errorf("no foreign key between %s and %s", table, embed.table)
-					}
-					if embed.isInner {
-						joinClauses = append(joinClauses, fmt.Sprintf(
-							` INNER JOIN %s.%s ON %s.%s = %s.%s`,
-							quoteIdent(schema), quoteIdent(embed.table),
-							quoteIdent(embed.table), quoteIdent(fk.fromCol),
-							quoteIdent(table), quoteIdent(fk.toCol),
-						))
-					} else {
-						joinClauses = append(joinClauses, fmt.Sprintf(
-							` LEFT JOIN %s.%s ON %s.%s = %s.%s`,
-							quoteIdent(schema), quoteIdent(embed.table),
-							quoteIdent(embed.table), quoteIdent(fk.fromCol),
-							quoteIdent(table), quoteIdent(fk.toCol),
-						))
-					}
+					joinClauses = append(joinClauses, fmt.Sprintf(
+						` LEFT JOIN %s.%s ON %s.%s = %s.%s`,
+						quoteIdent(schema), quoteIdent(embed.table),
+						quoteIdent(embed.table), quoteIdent(fk.fromCol),
+						quoteIdent(table), quoteIdent(fk.toCol),
+					))
 				}
 			}
+		}
 
-			query := fmt.Sprintf(`SELECT %s FROM %s.%s%s%s%s%s`,
-				strings.Join(selectParts, ", "),
-				quoteIdent(schema), quoteIdent(table),
-				strings.Join(joinClauses, ""),
-				where, orderBy, limitOffset,
-			)
+		if fkErr != nil {
+			writeError(w, http.StatusBadRequest, "PGRST102", fkErr.Error())
+			return
+		}
 
+		query := fmt.Sprintf(`SELECT %s FROM %s.%s%s%s%s%s`,
+			strings.Join(selectParts, ", "),
+			quoteIdent(schema), quoteIdent(table),
+			strings.Join(joinClauses, ""),
+			where, orderBy, limitOffset,
+		)
+
+		result, err = database.ExecuteWithRLS(ctx, pool, role, database.JWTClaims(claims), func(tx pgx.Tx) (interface{}, error) {
 			rows, qErr := tx.Query(ctx, query, whereArgs...)
 			if qErr != nil {
 				return nil, qErr
@@ -691,8 +699,10 @@ func buildSelectClause(selectParam string) string {
 	return strings.Join(cols, ", ")
 }
 
-// lookupFK finds a foreign key from fromTable to toTable in the given schema
-func lookupFK(ctx context.Context, tx pgx.Tx, schema, fromTable, toTable string) (*fkRelation, error) {
+// lookupFK finds a foreign key from fromTable to toTable in the given schema.
+// Uses the pool directly (not an RLS transaction) because information_schema
+// may not be visible to restricted roles like anon/authenticated.
+func lookupFK(ctx context.Context, pool *pgxpool.Pool, schema, fromTable, toTable string) (*fkRelation, error) {
 	query := `
 		SELECT kcu.column_name, ccu.column_name
 		FROM information_schema.table_constraints tc
@@ -707,7 +717,7 @@ func lookupFK(ctx context.Context, tx pgx.Tx, schema, fromTable, toTable string)
 		LIMIT 1
 	`
 	var fromCol, toCol string
-	err := tx.QueryRow(ctx, query, schema, fromTable, toTable).Scan(&fromCol, &toCol)
+	err := pool.QueryRow(ctx, query, schema, fromTable, toTable).Scan(&fromCol, &toCol)
 	if err != nil {
 		return nil, err
 	}
