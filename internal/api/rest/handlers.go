@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -218,10 +219,13 @@ func (h *Handler) handleSelect(ctx context.Context, w http.ResponseWriter, r *ht
 		var joinClauses []string
 		var fkErr error
 
+		log.Printf("[REST-DEBUG] Embedding: table=%s, schema=%s, embeds=%d, cols=%v", table, schema, len(embeds), cols)
 		for _, embed := range embeds {
+			log.Printf("[REST-DEBUG] Looking up FK: %s.%s -> %s.%s", schema, table, schema, embed.table)
 			// Try forward FK: main table has FK to embedded table
 			fk, err2 := lookupFK(ctx, pool, schema, table, embed.table)
 			if err2 == nil {
+				log.Printf("[REST-DEBUG] Forward FK found: %s.%s -> %s.%s", table, fk.fromCol, embed.table, fk.toCol)
 				// M:1 embedding — use correlated subquery
 				embCols := make([]string, len(embed.columns))
 				for i, c := range embed.columns {
@@ -237,6 +241,7 @@ func (h *Handler) handleSelect(ctx context.Context, w http.ResponseWriter, r *ht
 				)
 				selectParts = append(selectParts, subquery)
 			} else {
+				log.Printf("[REST-DEBUG] Forward FK failed: %v. Trying reverse...", err2)
 				// Try reverse FK: embedded table has FK to main table
 				fk, err2 = lookupFK(ctx, pool, schema, embed.table, table)
 				if err2 != nil {
@@ -272,14 +277,17 @@ func (h *Handler) handleSelect(ctx context.Context, w http.ResponseWriter, r *ht
 			strings.Join(joinClauses, ""),
 			where, orderBy, limitOffset,
 		)
+		log.Printf("[REST-DEBUG] Embedding query: %s (args: %v)", query, whereArgs)
 
 		result, err = database.ExecuteWithRLS(ctx, pool, role, database.JWTClaims(claims), func(tx pgx.Tx) (interface{}, error) {
 			rows, qErr := tx.Query(ctx, query, whereArgs...)
 			if qErr != nil {
+				log.Printf("[REST-DEBUG] Query error: %v", qErr)
 				return nil, qErr
 			}
 			data, cErr := collectRows(rows)
 			if cErr != nil {
+				log.Printf("[REST-DEBUG] CollectRows error: %v", cErr)
 				return nil, cErr
 			}
 
