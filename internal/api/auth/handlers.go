@@ -294,6 +294,7 @@ func (h *Handler) signupAnonymous(ctx context.Context, w http.ResponseWriter, r 
 			AppMetadata:      appMetadata,
 			UserMetadata:     userMetadata,
 			Identities:       []identityResponse{},
+			IsAnonymous:      true,
 			CreatedAt:        createdAt.Format(time.RFC3339),
 			UpdatedAt:        updatedAt.Format(time.RFC3339),
 		},
