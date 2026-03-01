@@ -66,6 +66,7 @@ type userResponse struct {
 	AppMetadata      map[string]interface{} `json:"app_metadata"`
 	UserMetadata     map[string]interface{} `json:"user_metadata"`
 	Identities       []identityResponse     `json:"identities"`
+	IsAnonymous      bool                   `json:"is_anonymous"`
 	CreatedAt        string                 `json:"created_at"`
 	UpdatedAt        string                 `json:"updated_at"`
 }
@@ -93,6 +94,7 @@ type sessionResponse struct {
 // ---------- Handlers ----------
 
 // Signup handles POST /auth/v1/signup
+// Supports both email+password signup and anonymous sign-in (empty body).
 func (h *Handler) Signup(w http.ResponseWriter, r *http.Request) {
 	project := middleware.GetProject(r)
 	pool := middleware.GetProjectSQL(r)
@@ -108,11 +110,21 @@ func (h *Handler) Signup(w http.ResponseWriter, r *http.Request) {
 
 	var req signupRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
+		// Empty body is OK for anonymous sign-in
+		req = signupRequest{}
 	}
 
 	email := strings.ToLower(strings.TrimSpace(req.Email))
+	ctx := r.Context()
+	now := time.Now()
+
+	// Anonymous sign-in: no email and no password provided
+	if email == "" && req.Password == "" {
+		h.signupAnonymous(ctx, w, r, project, pool, req.Data, now)
+		return
+	}
+
+	// Email+password signup
 	if email == "" || req.Password == "" {
 		writeError(w, http.StatusBadRequest, "email and password are required")
 		return
@@ -137,13 +149,10 @@ func (h *Handler) Signup(w http.ResponseWriter, r *http.Request) {
 	userMetaJSON, _ := json.Marshal(userMetadata)
 	appMetaJSON, _ := json.Marshal(appMetadata)
 
-	now := time.Now()
 	var emailConfirmedAt *time.Time
 	if project.Autoconfirm {
 		emailConfirmedAt = &now
 	}
-
-	ctx := r.Context()
 
 	// Insert user
 	var userID string
@@ -226,6 +235,67 @@ func (h *Handler) Signup(w http.ResponseWriter, r *http.Request) {
 			}},
 			CreatedAt: createdAt.Format(time.RFC3339),
 			UpdatedAt: updatedAt.Format(time.RFC3339),
+		},
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// signupAnonymous creates an anonymous user session (Supabase signInAnonymously).
+func (h *Handler) signupAnonymous(ctx context.Context, w http.ResponseWriter, r *http.Request, project *database.ProjectRecord, pool *pgxpool.Pool, data map[string]interface{}, now time.Time) {
+	userMetadata := data
+	if userMetadata == nil {
+		userMetadata = map[string]interface{}{}
+	}
+	appMetadata := map[string]interface{}{"provider": "anonymous", "providers": []string{"anonymous"}}
+	userMetaJSON, _ := json.Marshal(userMetadata)
+	appMetaJSON, _ := json.Marshal(appMetadata)
+
+	// Insert anonymous user (no email, no password, is_anonymous = true)
+	var userID string
+	var createdAt, updatedAt time.Time
+	err := pool.QueryRow(ctx, `
+		INSERT INTO auth.users (encrypted_password, email_confirmed_at,
+			raw_app_meta_data, raw_user_meta_data, aud, role, is_anonymous, last_sign_in_at)
+		VALUES ('', $1, $2, $3, 'authenticated', 'authenticated', true, $1)
+		RETURNING id, created_at, updated_at
+	`, now, string(appMetaJSON), string(userMetaJSON),
+	).Scan(&userID, &createdAt, &updatedAt)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create anonymous user")
+		return
+	}
+
+	// Create session
+	session, err := createSession(ctx, pool, project, userID, "", userMetadata, appMetadata, r)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create session")
+		return
+	}
+
+	lastSignIn := now.Format(time.RFC3339)
+	confirmedAt := now.Format(time.RFC3339)
+
+	resp := sessionResponse{
+		AccessToken:  session.accessToken,
+		TokenType:    "bearer",
+		ExpiresIn:    3600,
+		ExpiresAt:    session.expiresAt,
+		RefreshToken: session.refreshToken,
+		User: userResponse{
+			ID:               userID,
+			Aud:              "authenticated",
+			Role:             "authenticated",
+			Email:            "",
+			EmailConfirmedAt: nil,
+			Phone:            "",
+			ConfirmedAt:      &confirmedAt,
+			LastSignInAt:     &lastSignIn,
+			AppMetadata:      appMetadata,
+			UserMetadata:     userMetadata,
+			Identities:       []identityResponse{},
+			CreatedAt:        createdAt.Format(time.RFC3339),
+			UpdatedAt:        updatedAt.Format(time.RFC3339),
 		},
 	}
 
@@ -724,12 +794,13 @@ func fetchUser(ctx contextType, pool *pgxpool.Pool, userID string) (*userRespons
 	var rawAppMeta, rawUserMeta []byte
 	var createdAt, updatedAt time.Time
 	var phone *string
+	var isAnonymous bool
 
 	err := pool.QueryRow(ctx, `
 		SELECT email, email_confirmed_at, last_sign_in_at,
-			raw_app_meta_data, raw_user_meta_data, created_at, updated_at, phone
+			raw_app_meta_data, raw_user_meta_data, created_at, updated_at, phone, is_anonymous
 		FROM auth.users WHERE id = $1 AND deleted_at IS NULL
-	`, userID).Scan(&email, &emailConfirmedAt, &lastSignInAt, &rawAppMeta, &rawUserMeta, &createdAt, &updatedAt, &phone)
+	`, userID).Scan(&email, &emailConfirmedAt, &lastSignInAt, &rawAppMeta, &rawUserMeta, &createdAt, &updatedAt, &phone, &isAnonymous)
 	if err != nil {
 		return nil, err
 	}
@@ -768,6 +839,7 @@ func fetchUser(ctx contextType, pool *pgxpool.Pool, userID string) (*userRespons
 		AppMetadata:      appMeta,
 		UserMetadata:     userMeta,
 		Identities:       identities,
+		IsAnonymous:      isAnonymous,
 		CreatedAt:        createdAt.Format(time.RFC3339),
 		UpdatedAt:        updatedAt.Format(time.RFC3339),
 	}, nil
@@ -825,6 +897,53 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(v)
+}
+
+// AdminDeleteUser handles DELETE /auth/v1/admin/users/{id}
+// Requires service_role key. Deletes the user and all associated sessions/tokens.
+func (h *Handler) AdminDeleteUser(w http.ResponseWriter, r *http.Request) {
+	project := middleware.GetProject(r)
+	pool := middleware.GetProjectSQL(r)
+	if project == nil || pool == nil {
+		writeError(w, http.StatusInternalServerError, "missing project context")
+		return
+	}
+
+	// Only service_role can call admin endpoints
+	role := middleware.GetAPIKeyRole(r)
+	if role != "service_role" {
+		writeError(w, http.StatusForbidden, "admin access required")
+		return
+	}
+
+	// Extract user ID from URL path: /auth/v1/admin/users/{id}
+	userID := r.PathValue("id")
+	if userID == "" {
+		writeError(w, http.StatusBadRequest, "user id is required")
+		return
+	}
+
+	ctx := r.Context()
+
+	// Verify user exists
+	var exists bool
+	err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM auth.users WHERE id = $1 AND deleted_at IS NULL)`, userID).Scan(&exists)
+	if err != nil || !exists {
+		writeError(w, http.StatusNotFound, "User not found")
+		return
+	}
+
+	// Delete refresh tokens, sessions, identities, then soft-delete user
+	_, _ = pool.Exec(ctx, `DELETE FROM auth.refresh_tokens WHERE user_id = $1`, userID)
+	_, _ = pool.Exec(ctx, `DELETE FROM auth.sessions WHERE user_id = $1`, userID)
+	_, _ = pool.Exec(ctx, `DELETE FROM auth.identities WHERE user_id = $1`, userID)
+	_, err = pool.Exec(ctx, `UPDATE auth.users SET deleted_at = NOW(), updated_at = NOW() WHERE id = $1`, userID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to delete user")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{})
 }
 
 func writeError(w http.ResponseWriter, status int, message string) {

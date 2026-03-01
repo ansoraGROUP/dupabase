@@ -196,6 +196,7 @@ func (s *Server) registerRoutes() {
 	s.mux.Handle("GET /auth/v1/user", s.apiLimiter.Middleware(s.projectRouter.Middleware(http.HandlerFunc(s.supabaseAuth.GetUser))))
 	s.mux.Handle("PUT /auth/v1/user", s.apiLimiter.Middleware(maxBody(s.projectRouter.Middleware(http.HandlerFunc(s.supabaseAuth.UpdateUser)), 1<<20)))
 	s.mux.Handle("POST /auth/v1/logout", s.apiLimiter.Middleware(maxBody(s.projectRouter.Middleware(http.HandlerFunc(s.supabaseAuth.Logout)), 1<<20)))
+	s.mux.Handle("DELETE /auth/v1/admin/users/{id}", s.apiLimiter.Middleware(s.projectRouter.Middleware(http.HandlerFunc(s.supabaseAuth.AdminDeleteUser))))
 
 	// PostgREST-compatible REST API (rate-limited, body limit for mutating requests)
 	s.mux.Handle("/rest/v1/rpc/", s.apiLimiter.Middleware(maxBody(s.projectRouter.Middleware(http.HandlerFunc(s.supabaseRest.HandleRPC)), 1<<20)))
