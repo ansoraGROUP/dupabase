@@ -255,9 +255,9 @@ func (h *Handler) signupAnonymous(ctx context.Context, w http.ResponseWriter, r 
 	var userID string
 	var createdAt, updatedAt time.Time
 	err := pool.QueryRow(ctx, `
-		INSERT INTO auth.users (encrypted_password, email_confirmed_at,
+		INSERT INTO auth.users (email, encrypted_password, email_confirmed_at,
 			raw_app_meta_data, raw_user_meta_data, aud, role, is_anonymous, last_sign_in_at)
-		VALUES ('', $1, $2, $3, 'authenticated', 'authenticated', true, $1)
+		VALUES ('', '', $1, $2, $3, 'authenticated', 'authenticated', true, $1)
 		RETURNING id, created_at, updated_at
 	`, now, string(appMetaJSON), string(userMetaJSON),
 	).Scan(&userID, &createdAt, &updatedAt)
@@ -448,17 +448,21 @@ func (h *Handler) tokenRefresh(ctx contextType, w http.ResponseWriter, r *http.R
 	}
 
 	// Get user data
-	var email string
+	var emailPtr *string
 	var emailConfirmedAt *time.Time
 	var rawAppMeta, rawUserMeta []byte
 	var createdAt, updatedAt time.Time
 	err = pool.QueryRow(ctx, `
 		SELECT email, email_confirmed_at, raw_app_meta_data, raw_user_meta_data, created_at, updated_at
 		FROM auth.users WHERE id = $1 AND deleted_at IS NULL
-	`, userID).Scan(&email, &emailConfirmedAt, &rawAppMeta, &rawUserMeta, &createdAt, &updatedAt)
+	`, userID).Scan(&emailPtr, &emailConfirmedAt, &rawAppMeta, &rawUserMeta, &createdAt, &updatedAt)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "User not found")
 		return
+	}
+	email := ""
+	if emailPtr != nil {
+		email = *emailPtr
 	}
 
 	var appMetadata, userMetadata map[string]interface{}
@@ -789,7 +793,7 @@ func extractSessionFromAuth(r *http.Request, jwtSecret string) (string, error) {
 }
 
 func fetchUser(ctx contextType, pool *pgxpool.Pool, userID string) (*userResponse, error) {
-	var email string
+	var email *string
 	var emailConfirmedAt *time.Time
 	var lastSignInAt *time.Time
 	var rawAppMeta, rawUserMeta []byte
@@ -827,12 +831,16 @@ func fetchUser(ctx contextType, pool *pgxpool.Pool, userID string) (*userRespons
 	if phone != nil {
 		phoneStr = *phone
 	}
+	emailStr := ""
+	if email != nil {
+		emailStr = *email
+	}
 
 	return &userResponse{
 		ID:               userID,
 		Aud:              "authenticated",
 		Role:             "authenticated",
-		Email:            email,
+		Email:            emailStr,
 		EmailConfirmedAt: emailConfStr,
 		Phone:            phoneStr,
 		ConfirmedAt:      confirmedStr,
