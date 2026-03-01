@@ -252,12 +252,13 @@ func (h *Handler) signupAnonymous(ctx context.Context, w http.ResponseWriter, r 
 	appMetaJSON, _ := json.Marshal(appMetadata)
 
 	// Insert anonymous user (no email, no password, is_anonymous = true)
+	// email must be NULL (not empty string) to avoid unique constraint violations
 	var userID string
 	var createdAt, updatedAt time.Time
 	err := pool.QueryRow(ctx, `
-		INSERT INTO auth.users (email, encrypted_password, email_confirmed_at,
+		INSERT INTO auth.users (encrypted_password, email_confirmed_at,
 			raw_app_meta_data, raw_user_meta_data, aud, role, is_anonymous, last_sign_in_at)
-		VALUES ('', '', $1, $2, $3, 'authenticated', 'authenticated', true, $1)
+		VALUES ('', $1, $2, $3, 'authenticated', 'authenticated', true, $1)
 		RETURNING id, created_at, updated_at
 	`, now, string(appMetaJSON), string(userMetaJSON),
 	).Scan(&userID, &createdAt, &updatedAt)
