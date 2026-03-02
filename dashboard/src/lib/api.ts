@@ -145,19 +145,37 @@ export const imports = {
 
 // Backups
 export const backups = {
-  getSettings: (token: string) =>
-    api<BackupSettings>("/platform/backups/settings", { token }),
+  getSettings: (token: string, orgId?: string) =>
+    api<BackupSettings>(`/platform/backups/settings${orgId ? `?org_id=${orgId}` : ''}`, { token }),
   saveSettings: (token: string, settings: SaveBackupSettingsRequest) =>
     api<BackupSettings>("/platform/backups/settings", {
       method: "POST",
       body: settings,
       token,
     }),
-  getHistory: (token: string) =>
-    api<BackupHistoryItem[]>("/platform/backups/history", { token }),
-  runNow: (token: string) =>
-    api<{ status: string }>("/platform/backups/run", {
+  getHistory: (token: string, orgId?: string) =>
+    api<BackupHistoryItem[]>(`/platform/backups/history${orgId ? `?org_id=${orgId}` : ''}`, { token }),
+  runNow: (token: string, orgId?: string) =>
+    api<{ status: string }>(`/platform/backups/run${orgId ? `?org_id=${orgId}` : ''}`, {
       method: "POST",
+      token,
+    }),
+  testConnection: (token: string, config: TestS3ConnectionRequest) =>
+    api<{ status: string }>("/platform/backups/test-connection", {
+      method: "POST",
+      body: config,
+      token,
+    }),
+  toggleEnabled: (token: string, enabled: boolean, platformPassword: string) =>
+    api<BackupSettings>("/platform/backups/settings", {
+      method: "PATCH",
+      body: { enabled, platform_password: platformPassword },
+      token,
+    }),
+  restoreBackup: (token: string, historyId: number, platformPassword: string) =>
+    api<{ task_id: number; status: string }>(`/platform/backups/${historyId}/restore`, {
+      method: "POST",
+      body: { platform_password: platformPassword },
       token,
     }),
 };
@@ -267,6 +285,15 @@ export interface SaveBackupSettingsRequest {
   retention_days?: number;
   project_ids?: string[];
   platform_password: string;
+  org_id?: string;
+}
+
+export interface TestS3ConnectionRequest {
+  s3_endpoint: string;
+  s3_region: string;
+  s3_bucket: string;
+  s3_access_key: string;
+  s3_secret_key: string;
 }
 
 export interface BackupSettings {
@@ -287,7 +314,7 @@ export interface BackupHistoryItem {
   db_name: string;
   s3_key: string;
   size_bytes: number | null;
-  status: "running" | "completed" | "failed";
+  status: "running" | "completed" | "failed" | "cancelled";
   error_message: string | null;
   started_at: string;
   completed_at: string | null;

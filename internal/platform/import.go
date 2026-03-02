@@ -974,6 +974,7 @@ func extractSupabaseAuthUsers(filePath string) ([]supabaseAuthUser, error) {
 	var users []supabaseAuthUser
 	inCopy := false
 	var copyColumns []string
+	var insertAccum strings.Builder // accumulates multi-line INSERT statements
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -992,6 +993,18 @@ func extractSupabaseAuthUsers(filePath string) ([]supabaseAuthUser, error) {
 			continue
 		}
 
+		// If accumulating a multi-line INSERT statement
+		if insertAccum.Len() > 0 {
+			insertAccum.WriteString(" ")
+			insertAccum.WriteString(trimmed)
+			if strings.HasSuffix(trimmed, ";") {
+				parsed := parseInsertIntoAuthUsers(insertAccum.String())
+				users = append(users, parsed...)
+				insertAccum.Reset()
+			}
+			continue
+		}
+
 		// Detect COPY auth.users ... FROM stdin
 		upper := strings.ToUpper(trimmed)
 		if strings.HasPrefix(upper, "COPY AUTH.USERS") && strings.Contains(upper, "FROM STDIN") {
@@ -1001,6 +1014,25 @@ func extractSupabaseAuthUsers(filePath string) ([]supabaseAuthUser, error) {
 			}
 			continue
 		}
+
+		// Detect INSERT INTO auth.users
+		if strings.HasPrefix(upper, "INSERT INTO AUTH.USERS") {
+			if strings.HasSuffix(trimmed, ";") {
+				// Single-line INSERT
+				parsed := parseInsertIntoAuthUsers(trimmed)
+				users = append(users, parsed...)
+			} else {
+				// Multi-line INSERT — accumulate until semicolon
+				insertAccum.WriteString(trimmed)
+			}
+			continue
+		}
+	}
+
+	// Flush any remaining accumulated INSERT (missing semicolon at EOF)
+	if insertAccum.Len() > 0 {
+		parsed := parseInsertIntoAuthUsers(insertAccum.String())
+		users = append(users, parsed...)
 	}
 
 	return users, scanner.Err()
@@ -1133,6 +1165,206 @@ func insertMigratedUsers(ctx context.Context, dbURL string, users []supabaseAuth
 	var count int
 	fmt.Sscanf(strings.TrimSpace(string(countOut)), "%d", &count)
 	return count, nil
+}
+
+// --- INSERT INTO auth.users parsing ---
+
+// parseInsertIntoAuthUsers parses an INSERT INTO auth.users (cols) VALUES (v1), (v2) statement.
+func parseInsertIntoAuthUsers(stmt string) []supabaseAuthUser {
+	// Extract column list between first ( and its matching )
+	colStart := strings.Index(stmt, "(")
+	if colStart < 0 {
+		return nil
+	}
+	colEnd := strings.Index(stmt[colStart:], ")")
+	if colEnd < 0 {
+		return nil
+	}
+	colEnd += colStart
+	colStr := stmt[colStart+1 : colEnd]
+	columns := splitSQLValues(colStr)
+	for i := range columns {
+		columns[i] = strings.TrimSpace(columns[i])
+	}
+	if len(columns) == 0 {
+		return nil
+	}
+
+	// Find VALUES keyword after the column list
+	remainder := stmt[colEnd+1:]
+	upperRem := strings.ToUpper(strings.TrimSpace(remainder))
+	if !strings.HasPrefix(upperRem, "VALUES") {
+		return nil
+	}
+	valuesIdx := strings.Index(strings.ToUpper(remainder), "VALUES")
+	valuesStr := strings.TrimSpace(remainder[valuesIdx+6:])
+	// Remove trailing semicolon
+	valuesStr = strings.TrimSuffix(strings.TrimSpace(valuesStr), ";")
+
+	// Split into individual value groups: (v1, v2), (v3, v4)
+	groups := splitValueGroups(valuesStr)
+
+	var users []supabaseAuthUser
+	for _, group := range groups {
+		// Remove outer parens
+		group = strings.TrimSpace(group)
+		if len(group) < 2 || group[0] != '(' || group[len(group)-1] != ')' {
+			continue
+		}
+		inner := group[1 : len(group)-1]
+		vals := splitSQLValues(inner)
+		if len(vals) < len(columns) {
+			continue
+		}
+
+		colMap := make(map[string]string, len(columns))
+		for i, col := range columns {
+			if i < len(vals) {
+				colMap[col] = unquoteSQLValue(strings.TrimSpace(vals[i]))
+			}
+		}
+
+		users = append(users, supabaseAuthUser{
+			id:                colMap["id"],
+			email:             colMap["email"],
+			encryptedPassword: colMap["encrypted_password"],
+			emailConfirmedAt:  colMap["email_confirmed_at"],
+			phone:             colMap["phone"],
+			phoneConfirmedAt:  colMap["phone_confirmed_at"],
+			lastSignInAt:      colMap["last_sign_in_at"],
+			rawAppMetaData:    colMap["raw_app_meta_data"],
+			rawUserMetaData:   colMap["raw_user_meta_data"],
+			isAnonymous:       colMap["is_anonymous"],
+			bannedUntil:       colMap["banned_until"],
+			createdAt:         colMap["created_at"],
+			updatedAt:         colMap["updated_at"],
+		})
+	}
+	return users
+}
+
+// splitValueGroups splits "(v1, v2), (v3, v4)" into ["(v1, v2)", "(v3, v4)"]
+// respecting quoted strings and nested parentheses.
+func splitValueGroups(s string) []string {
+	var groups []string
+	depth := 0
+	inSingleQuote := false
+	start := -1
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inSingleQuote {
+			if c == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++ // escaped quote
+				} else {
+					inSingleQuote = false
+				}
+			}
+			continue
+		}
+		switch c {
+		case '\'':
+			inSingleQuote = true
+		case '(':
+			if depth == 0 {
+				start = i
+			}
+			depth++
+		case ')':
+			depth--
+			if depth == 0 && start >= 0 {
+				groups = append(groups, s[start:i+1])
+				start = -1
+			}
+		}
+	}
+	return groups
+}
+
+// splitSQLValues splits comma-separated SQL values, respecting single-quoted strings
+// and nested parentheses (e.g., function calls, type casts).
+func splitSQLValues(s string) []string {
+	var result []string
+	depth := 0
+	inSingleQuote := false
+	start := 0
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inSingleQuote {
+			if c == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++ // escaped quote
+				} else {
+					inSingleQuote = false
+				}
+			}
+			continue
+		}
+		switch c {
+		case '\'':
+			inSingleQuote = true
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				result = append(result, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+	// Last segment
+	if start <= len(s) {
+		result = append(result, s[start:])
+	}
+	return result
+}
+
+// unquoteSQLValue removes SQL quotes, type casts (::jsonb, ::timestamptz), and handles NULL.
+func unquoteSQLValue(s string) string {
+	if s == "" {
+		return ""
+	}
+
+	upper := strings.ToUpper(s)
+	if upper == "NULL" {
+		return ""
+	}
+	if upper == "TRUE" || upper == "T" {
+		return "true"
+	}
+	if upper == "FALSE" || upper == "F" {
+		return "false"
+	}
+
+	// Remove type casts like ::jsonb, ::uuid, ::timestamptz
+	// Only strip if the cast is outside quotes
+	if s[0] == '\'' {
+		// Find matching closing quote (handle escaped quotes)
+		end := -1
+		for i := 1; i < len(s); i++ {
+			if s[i] == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++
+					continue
+				}
+				end = i
+				break
+			}
+		}
+		if end > 0 {
+			inner := s[1:end]
+			// Unescape doubled quotes
+			return strings.ReplaceAll(inner, "''", "'")
+		}
+	}
+
+	return s
 }
 
 // SQL escaping helpers for migration

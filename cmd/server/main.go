@@ -368,5 +368,26 @@ BEGIN
 END $$;
 `,
 		},
+		{
+			Name: "009_backup_org_scoping.sql",
+			SQL: `
+-- Add org_id to backup_settings for org-scoped backups
+ALTER TABLE platform.backup_settings ADD COLUMN IF NOT EXISTS org_id UUID REFERENCES platform.organizations(id);
+
+-- Backfill org_id from user's personal org
+UPDATE platform.backup_settings bs SET org_id = (
+    SELECT o.id FROM platform.organizations o WHERE o.slug = 'personal-' || bs.user_id::text LIMIT 1
+) WHERE bs.org_id IS NULL;
+
+-- Fix backup_history status CHECK to include 'cancelled'
+ALTER TABLE platform.backup_history DROP CONSTRAINT IF EXISTS backup_history_status_check;
+ALTER TABLE platform.backup_history ADD CONSTRAINT backup_history_status_check
+    CHECK (status IN ('running', 'completed', 'failed', 'cancelled'));
+
+-- Add indexes for org-scoped queries
+CREATE INDEX IF NOT EXISTS idx_backup_settings_org_id ON platform.backup_settings(org_id);
+CREATE INDEX IF NOT EXISTS idx_backup_history_project ON platform.backup_history(project_id);
+`,
+		},
 	}
 }
