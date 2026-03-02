@@ -139,6 +139,10 @@ func scanQueryResults(rows pgx.Rows) (*SQLResponse, int, error) {
 		if err != nil {
 			return nil, http.StatusInternalServerError, fmt.Errorf("scan values: %w", err)
 		}
+		// Sanitize values for JSON serialization (e.g. UUID [16]byte → string)
+		for i, v := range vals {
+			vals[i] = sanitizeValue(v)
+		}
 		resultRows = append(resultRows, vals)
 	}
 	if err := rows.Err(); err != nil {

@@ -158,6 +158,8 @@ export function DataGrid({
                       </div>
                     ) : cell === null ? (
                       <span className="text-muted-foreground italic">NULL</span>
+                    ) : typeof cell === "object" ? (
+                      JSON.stringify(cell)
                     ) : (
                       String(cell)
                     )}

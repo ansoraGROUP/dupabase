@@ -139,7 +139,7 @@ func securityHeaders(next http.Handler, trustProxy bool) http.Handler {
 		if isAPIRoute(r.URL.Path) {
 			w.Header().Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
 		} else {
-			w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'")
+			w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net blob:; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: blob:; font-src 'self' data: https://cdn.jsdelivr.net; connect-src 'self' https://cdn.jsdelivr.net; worker-src 'self' blob:; frame-ancestors 'none'")
 		}
 
 		// HSTS — enable in production behind TLS.

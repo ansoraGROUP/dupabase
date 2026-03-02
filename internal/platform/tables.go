@@ -2,15 +2,50 @@ package platform
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/ansoraGROUP/dupabase/internal/database"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// sanitizeValue converts pgx native types (e.g. [16]byte UUIDs, net.IPNet) into
+// JSON-friendly representations so encoding/json doesn't produce byte arrays.
+func sanitizeValue(v interface{}) interface{} {
+	if v == nil {
+		return nil
+	}
+	switch val := v.(type) {
+	case [16]byte:
+		// UUID bytes → formatted UUID string
+		return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+			val[0:4], val[4:6], val[6:8], val[8:10], val[10:16])
+	case time.Time:
+		return val.Format(time.RFC3339Nano)
+	case []byte:
+		// Try to return as string if it's valid UTF-8-ish, else hex
+		return string(val)
+	case json.RawMessage:
+		var parsed interface{}
+		if err := json.Unmarshal(val, &parsed); err == nil {
+			return parsed
+		}
+		return string(val)
+	case map[string]interface{}:
+		return val
+	default:
+		// Let fmt.Stringer types render as strings
+		if s, ok := v.(fmt.Stringer); ok {
+			return s.String()
+		}
+		return v
+	}
+}
 
 // safeIdentRegex validates SQL identifiers to prevent injection.
 // Allows letters, digits, and underscores; must start with a letter or underscore; max 63 chars.
@@ -235,6 +270,10 @@ func (s *TableService) GetTableRows(ctx context.Context, projectID, schema, tabl
 		values, err := rows.Values()
 		if err != nil {
 			return nil, http.StatusInternalServerError, fmt.Errorf("scan row: %w", err)
+		}
+		// Sanitize values for JSON serialization (e.g. UUID [16]byte → string)
+		for i, v := range values {
+			values[i] = sanitizeValue(v)
 		}
 		resultRows = append(resultRows, values)
 	}

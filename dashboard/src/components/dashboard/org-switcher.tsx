@@ -71,8 +71,8 @@ export default function OrgSwitcher() {
                   <span className="text-sm font-medium truncate max-w-[140px]">
                     {activeOrg?.name ?? "No organization"}
                   </span>
-                  <span className="text-xs text-muted-foreground">
-                    {activeOrg?.slug ?? "Select or create"}
+                  <span className="text-xs text-muted-foreground truncate max-w-[140px]">
+                    {activeOrg ? (activeOrg.slug.startsWith("personal-") ? "Personal workspace" : activeOrg.slug) : "Select or create"}
                   </span>
                 </div>
                 <ChevronsUpDown className="ml-auto h-4 w-4" />

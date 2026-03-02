@@ -44,7 +44,7 @@ import {
 import Link from "next/link";
 
 const ACTION_OPTIONS = [
-  { value: "", label: "All Actions" },
+  { value: "all", label: "All Actions" },
   { value: "signup", label: "Signup" },
   { value: "login", label: "Login" },
   { value: "logout", label: "Logout" },
@@ -81,7 +81,7 @@ export default function LogsPage({
   const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(true);
-  const [actionFilter, setActionFilter] = useState("");
+  const [actionFilter, setActionFilter] = useState("all");
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
   const [expandedRow, setExpandedRow] = useState<number | null>(null);
@@ -92,7 +92,7 @@ export default function LogsPage({
     setLoading(true);
     const { data, error } = await logsApi.list(token, id, {
       page,
-      action: actionFilter,
+      action: actionFilter === "all" ? "" : actionFilter,
       from: fromDate,
       to: toDate,
     });
