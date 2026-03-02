@@ -4,17 +4,22 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
+	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/ansoraGROUP/dupabase/internal/database"
+	"github.com/ansoraGROUP/dupabase/internal/httputil"
+	"github.com/ansoraGROUP/dupabase/internal/middleware"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/ansoraGROUP/dupabase/internal/database"
-	"github.com/ansoraGROUP/dupabase/internal/middleware"
 )
 
 type Handler struct{}
@@ -25,7 +30,7 @@ func NewHandler() *Handler {
 
 // HandleTable handles all CRUD operations on /rest/v1/{table}
 func (h *Handler) HandleTable(w http.ResponseWriter, r *http.Request) {
-project := middleware.GetProject(r)
+	project := middleware.GetProject(r)
 	pool := middleware.GetProjectSQL(r)
 	if project == nil || pool == nil {
 		writeError(w, http.StatusInternalServerError, "PGRST000", "missing project context")
@@ -96,7 +101,10 @@ func (h *Handler) HandleRPC(w http.ResponseWriter, r *http.Request) {
 	// Parse function arguments
 	var args map[string]interface{}
 	if r.Body != nil {
-		json.NewDecoder(r.Body).Decode(&args)
+		if err := json.NewDecoder(r.Body).Decode(&args); err != nil && err != io.EOF {
+			writeError(w, http.StatusBadRequest, "PGRST100", "request body is not valid JSON")
+			return
+		}
 	}
 
 	// Build SELECT statement for RPC
@@ -134,7 +142,21 @@ func (h *Handler) HandleRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, result)
+	httputil.WriteJSON(w, http.StatusOK, result)
+}
+
+// hasFilterParams returns true if the query string contains at least one filter parameter
+// (i.e., a parameter that is not a reserved non-filter keyword like select, order, limit, etc.).
+func hasFilterParams(q url.Values) bool {
+	for k := range q {
+		switch k {
+		case "select", "order", "limit", "offset", "on_conflict", "columns":
+			continue
+		default:
+			return true
+		}
+	}
+	return false
 }
 
 // ---------- CRUD handlers ----------
@@ -148,7 +170,11 @@ func (h *Handler) handleSelect(ctx context.Context, w http.ResponseWriter, r *ht
 	cols, embeds := parseSelectWithEmbedding(selectParam)
 
 	// Build WHERE clause from filters
-	where, whereArgs := buildWhereClause(q, schema, table)
+	where, whereArgs, whereErr := buildWhereClause(q, schema, table)
+	if whereErr != nil {
+		writeError(w, http.StatusBadRequest, "PGRST100", whereErr.Error())
+		return
+	}
 
 	// Build ORDER BY
 	orderBy := ""
@@ -206,8 +232,15 @@ func (h *Handler) handleSelect(ctx context.Context, w http.ResponseWriter, r *ht
 				countQuery := fmt.Sprintf(`SELECT COUNT(*) FROM %s.%s%s`,
 					quoteIdent(schema), quoteIdent(table), where)
 				var total int
-				tx.QueryRow(ctx, countQuery, whereArgs...).Scan(&total)
-				w.Header().Set("Content-Range", fmt.Sprintf("0-%d/%d", len(data.([]map[string]interface{}))-1, total))
+				if err := tx.QueryRow(ctx, countQuery, whereArgs...).Scan(&total); err != nil {
+					slog.Warn("count query scan failed", "error", err)
+					total = 0
+				}
+				if dataSlice := data.([]map[string]interface{}); len(dataSlice) > 0 {
+					w.Header().Set("Content-Range", fmt.Sprintf("0-%d/%d", len(dataSlice)-1, total))
+				} else {
+					w.Header().Set("Content-Range", fmt.Sprintf("*/%d", total))
+				}
 			}
 			return data, nil
 		})
@@ -219,8 +252,8 @@ func (h *Handler) handleSelect(ctx context.Context, w http.ResponseWriter, r *ht
 		var joinClauses []string
 		var fkErr error
 
-for _, embed := range embeds {
-// Try forward FK: main table has FK to embedded table
+		for _, embed := range embeds {
+			// Try forward FK: main table has FK to embedded table
 			fk, err2 := lookupFK(ctx, pool, schema, table, embed.table)
 			if err2 == nil {
 
@@ -239,7 +272,7 @@ for _, embed := range embeds {
 				)
 				selectParts = append(selectParts, subquery)
 			} else {
-// Try reverse FK: embedded table has FK to main table
+				// Try reverse FK: embedded table has FK to main table
 				fk, err2 = lookupFK(ctx, pool, schema, embed.table, table)
 				if err2 != nil {
 					fkErr = fmt.Errorf("no foreign key between %s and %s", table, embed.table)
@@ -274,14 +307,14 @@ for _, embed := range embeds {
 			strings.Join(joinClauses, ""),
 			where, orderBy, limitOffset,
 		)
-result, err = database.ExecuteWithRLS(ctx, pool, role, database.JWTClaims(claims), func(tx pgx.Tx) (interface{}, error) {
+		result, err = database.ExecuteWithRLS(ctx, pool, role, database.JWTClaims(claims), func(tx pgx.Tx) (interface{}, error) {
 			rows, qErr := tx.Query(ctx, query, whereArgs...)
 			if qErr != nil {
-return nil, qErr
+				return nil, qErr
 			}
 			data, cErr := collectRows(rows)
 			if cErr != nil {
-return nil, cErr
+				return nil, cErr
 			}
 
 			if wantCount {
@@ -289,8 +322,15 @@ return nil, cErr
 					quoteIdent(schema), quoteIdent(table),
 					strings.Join(joinClauses, ""), where)
 				var total int
-				tx.QueryRow(ctx, countQuery, whereArgs...).Scan(&total)
-				w.Header().Set("Content-Range", fmt.Sprintf("0-%d/%d", len(data.([]map[string]interface{}))-1, total))
+				if err := tx.QueryRow(ctx, countQuery, whereArgs...).Scan(&total); err != nil {
+					slog.Warn("count query scan failed", "error", err)
+					total = 0
+				}
+				if dataSlice := data.([]map[string]interface{}); len(dataSlice) > 0 {
+					w.Header().Set("Content-Range", fmt.Sprintf("0-%d/%d", len(dataSlice)-1, total))
+				} else {
+					w.Header().Set("Content-Range", fmt.Sprintf("*/%d", total))
+				}
 			}
 			return data, nil
 		})
@@ -309,11 +349,11 @@ return nil, cErr
 			writeError(w, http.StatusNotAcceptable, "PGRST116", "JSON object requested, multiple (or no) rows returned")
 			return
 		}
-		writeJSON(w, http.StatusOK, rows[0])
+		httputil.WriteJSON(w, http.StatusOK, rows[0])
 		return
 	}
 
-	writeJSON(w, http.StatusOK, result)
+	httputil.WriteJSON(w, http.StatusOK, result)
 }
 
 func (h *Handler) handleInsert(ctx context.Context, w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, role string, claims map[string]interface{}, schema, table string) {
@@ -473,6 +513,11 @@ func (h *Handler) handleInsert(ctx context.Context, w http.ResponseWriter, r *ht
 }
 
 func (h *Handler) handleUpdate(ctx context.Context, w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, role string, claims map[string]interface{}, schema, table string) {
+	if !hasFilterParams(r.URL.Query()) {
+		writeError(w, http.StatusBadRequest, "PGRST116", "Bulk update requires at least one filter parameter")
+		return
+	}
+
 	var body map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "PGRST100", "invalid JSON body")
@@ -484,7 +529,11 @@ func (h *Handler) handleUpdate(ctx context.Context, w http.ResponseWriter, r *ht
 		return
 	}
 
-	where, whereArgs := buildWhereClause(r.URL.Query(), schema, table)
+	where, whereArgs, whereErr := buildWhereClause(r.URL.Query(), schema, table)
+	if whereErr != nil {
+		writeError(w, http.StatusBadRequest, "PGRST100", whereErr.Error())
+		return
+	}
 
 	setClauses := make([]string, 0)
 	setArgs := make([]interface{}, 0)
@@ -536,7 +585,16 @@ func (h *Handler) handleUpdate(ctx context.Context, w http.ResponseWriter, r *ht
 }
 
 func (h *Handler) handleDelete(ctx context.Context, w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, role string, claims map[string]interface{}, schema, table string) {
-	where, whereArgs := buildWhereClause(r.URL.Query(), schema, table)
+	if !hasFilterParams(r.URL.Query()) {
+		writeError(w, http.StatusBadRequest, "PGRST116", "Bulk delete requires at least one filter parameter")
+		return
+	}
+
+	where, whereArgs, whereErr := buildWhereClause(r.URL.Query(), schema, table)
+	if whereErr != nil {
+		writeError(w, http.StatusBadRequest, "PGRST100", whereErr.Error())
+		return
+	}
 
 	prefer := parsePrefer(r.Header.Get("Prefer"))
 	returnRepr := prefer["return"] == "representation"
@@ -725,7 +783,7 @@ func lookupFK(ctx context.Context, pool *pgxpool.Pool, schema, fromTable, toTabl
 	return &fkRelation{fromCol: fromCol, toCol: toCol, fromTable: fromTable, toTable: toTable}, nil
 }
 
-func buildWhereClause(q map[string][]string, schema, table string) (string, []interface{}) {
+func buildWhereClause(q map[string][]string, schema, table string) (string, []interface{}, error) {
 	// Reserved params that are not filters
 	reserved := map[string]bool{"select": true, "order": true, "limit": true, "offset": true, "on_conflict": true, "columns": true}
 
@@ -737,9 +795,9 @@ func buildWhereClause(q map[string][]string, schema, table string) (string, []in
 		if reserved[key] {
 			continue
 		}
-		// Handle logical operators: and, or, not
+		// Logical operators are not yet supported
 		if key == "and" || key == "or" || key == "not.and" || key == "not.or" {
-			continue // TODO: implement nested logical operators
+			return "", nil, fmt.Errorf("unsupported logical operator: %s", key)
 		}
 
 		for _, val := range values {
@@ -753,10 +811,10 @@ func buildWhereClause(q map[string][]string, schema, table string) (string, []in
 	}
 
 	if len(conditions) == 0 {
-		return "", nil
+		return "", nil, nil
 	}
 
-	return " WHERE " + strings.Join(conditions, " AND "), args
+	return " WHERE " + strings.Join(conditions, " AND "), args, nil
 }
 
 // quoteIdentDotted handles table.column notation (e.g., "user_categories.user_id")
@@ -970,13 +1028,24 @@ func resolveRoleAndClaims(r *http.Request, project *database.ProjectRecord) (str
 
 // allowedSchemas are schemas that can be accessed via the REST API.
 // Only public and explicitly user-created schemas are allowed.
-var allowedSchemas = map[string]bool{
-	"public": true,
+// Additional schemas can be added via the ALLOWED_SCHEMAS env var.
+var allowedSchemas map[string]bool
+
+func init() {
+	allowedSchemas = map[string]bool{"public": true}
+	if schemas := os.Getenv("ALLOWED_SCHEMAS"); schemas != "" {
+		for _, s := range strings.Split(schemas, ",") {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				allowedSchemas[s] = true
+			}
+		}
+	}
 }
 
 // isAllowedSchema checks if a schema name is safe to query.
 func isAllowedSchema(schema string) bool {
-	return allowedSchemas[strings.ToLower(schema)]
+	return allowedSchemas[schema]
 }
 
 func extractTableName(path string) string {
@@ -993,6 +1062,9 @@ func extractRPCName(path string) string {
 	// /rest/v1/rpc/function_name -> function_name
 	path = strings.TrimPrefix(path, "/rest/v1/rpc/")
 	path = strings.TrimSuffix(path, "/")
+	if strings.Contains(path, "/") {
+		return ""
+	}
 	return path
 }
 
@@ -1067,12 +1139,6 @@ func convertPgValue(v interface{}) interface{} {
 	}
 }
 
-func writeJSON(w http.ResponseWriter, status int, v interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
-}
-
 // sanitizeDBError removes internal database details from error messages.
 func sanitizeDBError(err error) string {
 	msg := err.Error()
@@ -1092,8 +1158,8 @@ func sanitizeDBError(err error) string {
 	if strings.Contains(msg, "violates check constraint") {
 		return "check constraint violation"
 	}
-	if strings.Contains(msg, "does not exist") {
-		return "requested resource does not exist"
+	if strings.Contains(msg, "relation") && strings.Contains(msg, "does not exist") {
+		return "Requested resource does not exist"
 	}
 	if strings.Contains(msg, "permission denied") {
 		return "permission denied"
@@ -1112,10 +1178,10 @@ func writeMaybeObject(w http.ResponseWriter, r *http.Request, status int, result
 			writeError(w, http.StatusNotAcceptable, "PGRST116", "JSON object requested, multiple (or no) rows returned")
 			return
 		}
-		writeJSON(w, status, rows[0])
+		httputil.WriteJSON(w, status, rows[0])
 		return
 	}
-	writeJSON(w, status, result)
+	httputil.WriteJSON(w, status, result)
 }
 
 // getPrimaryKeyCols returns the primary key column names for a table.
@@ -1154,7 +1220,7 @@ func getPrimaryKeyCols(ctx context.Context, pool *pgxpool.Pool, role string, cla
 }
 
 func writeError(w http.ResponseWriter, status int, code, message string) {
-	writeJSON(w, status, map[string]interface{}{
+	httputil.WriteJSON(w, status, map[string]interface{}{
 		"code":    code,
 		"message": message,
 		"details": nil,

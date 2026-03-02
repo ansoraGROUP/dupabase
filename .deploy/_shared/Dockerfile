@@ -26,9 +26,11 @@ ENV NEXT_PUBLIC_API_URL=""
 RUN npm run build
 
 # Stage 3: Production
+# NOTE: Consider pinning to specific patch version (e.g., node:20.18.1-alpine3.20) for reproducible builds
 FROM node:20-alpine
 
-RUN apk --no-cache add ca-certificates tzdata postgresql16-client
+ARG PG_VERSION=16
+RUN apk --no-cache add ca-certificates tzdata postgresql${PG_VERSION}-client
 
 WORKDIR /app
 
@@ -45,7 +47,13 @@ COPY --from=next-builder /app/public ./dashboard/public
 COPY .deploy/_shared/entrypoint.sh .
 RUN chmod +x entrypoint.sh
 
+# Ensure imports directory is writable
+RUN mkdir -p /tmp/imports && chown node:node /tmp/imports
+
 EXPOSE 3333
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD wget -qO- http://localhost:3333/health || exit 1
 
 USER node
 

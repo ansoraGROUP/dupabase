@@ -6,19 +6,123 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"net"
 	"net/http"
+	"net/mail"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/ansoraGROUP/dupabase/internal/database"
+	"github.com/ansoraGROUP/dupabase/internal/httputil"
+	"github.com/ansoraGROUP/dupabase/internal/middleware"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/ansoraGROUP/dupabase/internal/database"
-	"github.com/ansoraGROUP/dupabase/internal/middleware"
 	"golang.org/x/crypto/bcrypt"
 )
 
 // dummyProjectHash is used for timing-safe login — prevents user enumeration via timing.
-var dummyProjectHash, _ = bcrypt.GenerateFromPassword([]byte("timing-safe-dummy-placeholder"), 12)
+var dummyProjectHash []byte
+
+// gotrueCleanupStop signals the cleanup goroutine to shut down.
+var gotrueCleanupStop chan struct{}
+
+func init() {
+	var err error
+	dummyProjectHash, err = bcrypt.GenerateFromPassword([]byte("timing-safe-dummy-placeholder"), bcrypt.DefaultCost)
+	if err != nil {
+		panic("failed to generate dummy bcrypt hash: " + err.Error())
+	}
+
+	gotrueCleanupStop = make(chan struct{})
+
+	// Periodically clean up stale login attempt entries to prevent unbounded map growth.
+	go func() {
+		ticker := time.NewTicker(lockoutDuration)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				loginAttemptsMu.Lock()
+				now := time.Now()
+				for email, a := range loginAttempts {
+					if now.Sub(a.lockedAt) >= lockoutDuration {
+						delete(loginAttempts, email)
+					}
+				}
+				loginAttemptsMu.Unlock()
+			case <-gotrueCleanupStop:
+				return
+			}
+		}
+	}()
+}
+
+// StopGoTrueCleanup signals the login attempt cleanup goroutine to stop.
+func StopGoTrueCleanup() {
+	close(gotrueCleanupStop)
+}
+
+// ---------- Per-email brute-force protection ----------
+
+type loginAttempt struct {
+	count    int
+	lockedAt time.Time
+}
+
+var (
+	loginAttempts   = make(map[string]*loginAttempt)
+	loginAttemptsMu sync.Mutex
+)
+
+const (
+	maxLoginAttempts = 5
+	lockoutDuration  = 15 * time.Minute
+)
+
+func isEmailLocked(email string) bool {
+	loginAttemptsMu.Lock()
+	defer loginAttemptsMu.Unlock()
+	a, ok := loginAttempts[email]
+	if !ok {
+		return false
+	}
+	if a.count >= maxLoginAttempts && time.Since(a.lockedAt) < lockoutDuration {
+		return true
+	}
+	if a.count >= maxLoginAttempts && time.Since(a.lockedAt) >= lockoutDuration {
+		delete(loginAttempts, email)
+		return false
+	}
+	return false
+}
+
+func recordFailedLogin(email string) {
+	loginAttemptsMu.Lock()
+	defer loginAttemptsMu.Unlock()
+	a, ok := loginAttempts[email]
+	if !ok {
+		a = &loginAttempt{}
+		loginAttempts[email] = a
+	}
+	a.count++
+	if a.count >= maxLoginAttempts {
+		a.lockedAt = time.Now()
+	}
+}
+
+func clearLoginAttempts(email string) {
+	loginAttemptsMu.Lock()
+	defer loginAttemptsMu.Unlock()
+	delete(loginAttempts, email)
+}
+
+// isValidEmail checks that the email address is well-formed per RFC 5322.
+func isValidEmail(email string) bool {
+	_, err := mail.ParseAddress(email)
+	return err == nil
+}
 
 // Handler implements GoTrue-compatible auth endpoints.
 type Handler struct{}
@@ -44,9 +148,10 @@ type tokenRequest struct {
 }
 
 type updateUserRequest struct {
-	Email    string                 `json:"email,omitempty"`
-	Password string                 `json:"password,omitempty"`
-	Data     map[string]interface{} `json:"data,omitempty"`
+	Email           string                 `json:"email,omitempty"`
+	Password        string                 `json:"password,omitempty"`
+	CurrentPassword string                 `json:"current_password,omitempty"`
+	Data            map[string]interface{} `json:"data,omitempty"`
 }
 
 type logoutRequest struct {
@@ -129,8 +234,16 @@ func (h *Handler) Signup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "email and password are required")
 		return
 	}
+	if !isValidEmail(email) {
+		writeError(w, http.StatusUnprocessableEntity, "invalid email format")
+		return
+	}
 	if len(req.Password) < project.PasswordMinLen {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("password must be at least %d characters", project.PasswordMinLen))
+		return
+	}
+	if len(req.Password) > 72 {
+		writeError(w, http.StatusBadRequest, "password must not exceed 72 characters")
 		return
 	}
 
@@ -146,8 +259,18 @@ func (h *Handler) Signup(w http.ResponseWriter, r *http.Request) {
 		userMetadata = map[string]interface{}{}
 	}
 	appMetadata := map[string]interface{}{"provider": "email", "providers": []string{"email"}}
-	userMetaJSON, _ := json.Marshal(userMetadata)
-	appMetaJSON, _ := json.Marshal(appMetadata)
+	userMetaJSON, err := json.Marshal(userMetadata)
+	if err != nil {
+		slog.Error("failed to marshal user metadata", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	appMetaJSON, err := json.Marshal(appMetadata)
+	if err != nil {
+		slog.Error("failed to marshal app metadata", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
 
 	var emailConfirmedAt *time.Time
 	if project.Autoconfirm {
@@ -175,12 +298,17 @@ func (h *Handler) Signup(w http.ResponseWriter, r *http.Request) {
 
 	// Create identity
 	identityData := map[string]interface{}{
-		"sub":              userID,
-		"email":            email,
-		"email_verified":   project.Autoconfirm,
-		"phone_verified":   false,
+		"sub":            userID,
+		"email":          email,
+		"email_verified": project.Autoconfirm,
+		"phone_verified": false,
 	}
-	identityJSON, _ := json.Marshal(identityData)
+	identityJSON, err := json.Marshal(identityData)
+	if err != nil {
+		slog.Error("failed to marshal identity data", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
 	var identityID string
 	err = pool.QueryRow(ctx, `
 		INSERT INTO auth.identities (user_id, provider_id, identity_data, provider, last_sign_in_at)
@@ -209,7 +337,7 @@ func (h *Handler) Signup(w http.ResponseWriter, r *http.Request) {
 	resp := sessionResponse{
 		AccessToken:  session.accessToken,
 		TokenType:    "bearer",
-		ExpiresIn:    3600,
+		ExpiresIn:    session.expiresIn,
 		ExpiresAt:    session.expiresAt,
 		RefreshToken: session.refreshToken,
 		User: userResponse{
@@ -238,7 +366,7 @@ func (h *Handler) Signup(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	writeJSON(w, http.StatusOK, resp)
+	httputil.WriteJSON(w, http.StatusOK, resp)
 }
 
 // signupAnonymous creates an anonymous user session (Supabase signInAnonymously).
@@ -251,15 +379,25 @@ func (h *Handler) signupAnonymous(ctx context.Context, w http.ResponseWriter, r 
 	}
 	// Real Supabase: app_metadata is empty {} for anonymous users (no provider/providers)
 	appMetadata := map[string]interface{}{}
-	userMetaJSON, _ := json.Marshal(userMetadata)
-	appMetaJSON, _ := json.Marshal(appMetadata)
+	userMetaJSON, err := json.Marshal(userMetadata)
+	if err != nil {
+		slog.Error("failed to marshal user metadata", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	appMetaJSON, err := json.Marshal(appMetadata)
+	if err != nil {
+		slog.Error("failed to marshal app metadata", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
 
 	// Insert anonymous user: email=NULL (not ''), no password, is_anonymous=true
 	// NULL emails don't violate unique constraints in PostgreSQL
 	// confirmed_at and email_confirmed_at are NULL (anonymous users are not "confirmed")
 	var userID string
 	var createdAt, updatedAt time.Time
-	err := pool.QueryRow(ctx, `
+	err = pool.QueryRow(ctx, `
 		INSERT INTO auth.users (encrypted_password,
 			raw_app_meta_data, raw_user_meta_data, aud, role, is_anonymous, last_sign_in_at)
 		VALUES ('', $1, $2, 'authenticated', 'authenticated', true, $3)
@@ -283,7 +421,7 @@ func (h *Handler) signupAnonymous(ctx context.Context, w http.ResponseWriter, r 
 	resp := sessionResponse{
 		AccessToken:  session.accessToken,
 		TokenType:    "bearer",
-		ExpiresIn:    3600,
+		ExpiresIn:    session.expiresIn,
 		ExpiresAt:    session.expiresAt,
 		RefreshToken: session.refreshToken,
 		User: userResponse{
@@ -304,7 +442,7 @@ func (h *Handler) signupAnonymous(ctx context.Context, w http.ResponseWriter, r 
 		},
 	}
 
-	writeJSON(w, http.StatusOK, resp)
+	httputil.WriteJSON(w, http.StatusOK, resp)
 }
 
 // Token handles POST /auth/v1/token?grant_type=...
@@ -338,6 +476,12 @@ func (h *Handler) tokenPassword(ctx contextType, w http.ResponseWriter, r *http.
 
 	email := strings.ToLower(strings.TrimSpace(req.Email))
 
+	// Per-email brute-force protection
+	if isEmailLocked(email) {
+		writeError(w, http.StatusTooManyRequests, "too many login attempts, try again later")
+		return
+	}
+
 	var userID, passwordHash string
 	var emailConfirmedAt *time.Time
 	var rawAppMeta, rawUserMeta []byte
@@ -350,23 +494,34 @@ func (h *Handler) tokenPassword(ctx contextType, w http.ResponseWriter, r *http.
 	`, email).Scan(&userID, &passwordHash, &emailConfirmedAt, &rawAppMeta, &rawUserMeta, &createdAt, &updatedAt)
 	if err != nil {
 		// Perform dummy bcrypt comparison to prevent user enumeration via timing
-		bcrypt.CompareHashAndPassword(dummyProjectHash, []byte(req.Password))
+		_ = bcrypt.CompareHashAndPassword(dummyProjectHash, []byte(req.Password)) // timing equalization — always fails
+		recordFailedLogin(email)
 		writeError(w, http.StatusBadRequest, "Invalid login credentials")
 		return
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.Password)); err != nil {
+		recordFailedLogin(email)
 		writeError(w, http.StatusBadRequest, "Invalid login credentials")
 		return
 	}
 
+	// Successful login — clear any failed attempt tracking
+	clearLoginAttempts(email)
+
 	var appMetadata, userMetadata map[string]interface{}
-	json.Unmarshal(rawAppMeta, &appMetadata)
-	json.Unmarshal(rawUserMeta, &userMetadata)
+	if err := json.Unmarshal(rawAppMeta, &appMetadata); err != nil {
+		slog.Warn("failed to unmarshal app_metadata", "user_id", userID, "error", err)
+	}
+	if err := json.Unmarshal(rawUserMeta, &userMetadata); err != nil {
+		slog.Warn("failed to unmarshal user_metadata", "user_id", userID, "error", err)
+	}
 
 	// Update last_sign_in_at
 	now := time.Now()
-	pool.Exec(ctx, `UPDATE auth.users SET last_sign_in_at = $1, updated_at = $1 WHERE id = $2`, now, userID)
+	if _, err := pool.Exec(ctx, `UPDATE auth.users SET last_sign_in_at = $1, updated_at = $1 WHERE id = $2`, now, userID); err != nil {
+		slog.Error("failed to update last_sign_in_at", "error", err, "user_id", userID)
+	}
 
 	session, err := createSession(ctx, pool, project, userID, email, userMetadata, appMetadata, r)
 	if err != nil {
@@ -387,7 +542,7 @@ func (h *Handler) tokenPassword(ctx contextType, w http.ResponseWriter, r *http.
 	resp := sessionResponse{
 		AccessToken:  session.accessToken,
 		TokenType:    "bearer",
-		ExpiresIn:    3600,
+		ExpiresIn:    session.expiresIn,
 		ExpiresAt:    session.expiresAt,
 		RefreshToken: session.refreshToken,
 		User: userResponse{
@@ -407,7 +562,7 @@ func (h *Handler) tokenPassword(ctx contextType, w http.ResponseWriter, r *http.
 		},
 	}
 
-	writeJSON(w, http.StatusOK, resp)
+	httputil.WriteJSON(w, http.StatusOK, resp)
 }
 
 func (h *Handler) tokenRefresh(ctx contextType, w http.ResponseWriter, r *http.Request, project *database.ProjectRecord, pool *pgxpool.Pool) {
@@ -445,12 +600,6 @@ func (h *Handler) tokenRefresh(ctx contextType, w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Revoke old token
-	if _, err := pool.Exec(ctx, `UPDATE auth.refresh_tokens SET revoked = true, updated_at = NOW() WHERE id = $1`, tokenID); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to revoke old token")
-		return
-	}
-
 	// Get user data
 	var emailPtr *string
 	var emailConfirmedAt *time.Time
@@ -470,12 +619,16 @@ func (h *Handler) tokenRefresh(ctx contextType, w http.ResponseWriter, r *http.R
 	}
 
 	var appMetadata, userMetadata map[string]interface{}
-	json.Unmarshal(rawAppMeta, &appMetadata)
-	json.Unmarshal(rawUserMeta, &userMetadata)
+	if err := json.Unmarshal(rawAppMeta, &appMetadata); err != nil {
+		slog.Warn("failed to unmarshal app_metadata", "user_id", userID, "error", err)
+	}
+	if err := json.Unmarshal(rawUserMeta, &userMetadata); err != nil {
+		slog.Warn("failed to unmarshal user_metadata", "user_id", userID, "error", err)
+	}
 
 	// Generate new tokens
 	now := time.Now()
-	accessToken, expiresAt, err := generateUserJWT(project.JWTSecret, project.SiteURL, userID, email, userMetadata, appMetadata, sessionID)
+	accessToken, expiresAt, expiresAtTime, err := generateUserJWT(project.JWTSecret, project.SiteURL, userID, email, userMetadata, appMetadata, sessionID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to generate token")
 		return
@@ -487,8 +640,23 @@ func (h *Handler) tokenRefresh(ctx contextType, w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Store new refresh token
-	_, err = pool.Exec(ctx, `
+	// Atomic token rotation: revoke old + insert new in a single transaction.
+	// If either fails, the old token remains valid and the user can retry.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to begin transaction")
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	// Revoke old token inside tx
+	if _, err := tx.Exec(ctx, `UPDATE auth.refresh_tokens SET revoked = true, updated_at = NOW() WHERE id = $1`, tokenID); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to revoke old token")
+		return
+	}
+
+	// Store new refresh token inside tx
+	_, err = tx.Exec(ctx, `
 		INSERT INTO auth.refresh_tokens (token, user_id, session_id, parent)
 		VALUES ($1, $2, $3, $4)
 	`, newRefreshToken, userID, sessionID, req.RefreshToken)
@@ -497,9 +665,14 @@ func (h *Handler) tokenRefresh(ctx contextType, w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Update session
-	if _, err := pool.Exec(ctx, `UPDATE auth.sessions SET refreshed_at = $1, updated_at = $1 WHERE id = $2`, now, sessionID); err != nil {
+	// Update session inside tx
+	if _, err := tx.Exec(ctx, `UPDATE auth.sessions SET refreshed_at = $1, updated_at = $1 WHERE id = $2`, now, sessionID); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to update session")
+		return
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to commit token refresh")
 		return
 	}
 
@@ -514,7 +687,7 @@ func (h *Handler) tokenRefresh(ctx contextType, w http.ResponseWriter, r *http.R
 	resp := sessionResponse{
 		AccessToken:  accessToken,
 		TokenType:    "bearer",
-		ExpiresIn:    3600,
+		ExpiresIn:    int(time.Until(expiresAtTime).Seconds()),
 		ExpiresAt:    expiresAt,
 		RefreshToken: newRefreshToken,
 		User: userResponse{
@@ -533,7 +706,7 @@ func (h *Handler) tokenRefresh(ctx contextType, w http.ResponseWriter, r *http.R
 		},
 	}
 
-	writeJSON(w, http.StatusOK, resp)
+	httputil.WriteJSON(w, http.StatusOK, resp)
 }
 
 // GetUser handles GET /auth/v1/user
@@ -559,7 +732,7 @@ func (h *Handler) GetUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, user)
+	httputil.WriteJSON(w, http.StatusOK, user)
 }
 
 // UpdateUser handles PUT /auth/v1/user
@@ -585,30 +758,95 @@ func (h *Handler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
+	// Validate password constraints before starting a transaction
 	if req.Password != "" {
+		if len(req.Password) < project.PasswordMinLen {
+			writeError(w, http.StatusUnprocessableEntity, fmt.Sprintf("password must be at least %d characters", project.PasswordMinLen))
+			return
+		}
+		if len(req.Password) > 72 {
+			writeError(w, http.StatusUnprocessableEntity, "password must not exceed 72 characters")
+			return
+		}
+		if req.CurrentPassword == "" {
+			writeError(w, http.StatusBadRequest, "current_password is required to change password")
+			return
+		}
+	}
+
+	// Begin transaction for atomicity
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to begin transaction")
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	if req.Password != "" {
+		// Fetch and lock the user row to prevent TOCTOU race between verification and update
+		var storedHash string
+		err := tx.QueryRow(ctx, `SELECT encrypted_password FROM auth.users WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`, userID).Scan(&storedHash)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to verify current password")
+			return
+		}
+		if err := bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(req.CurrentPassword)); err != nil {
+			writeError(w, http.StatusUnauthorized, "current password is incorrect")
+			return
+		}
+
 		hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), 12)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to hash password")
 			return
 		}
-		pool.Exec(ctx, `UPDATE auth.users SET encrypted_password = $1, updated_at = NOW() WHERE id = $2`, string(hash), userID)
+		if _, err := tx.Exec(ctx, `UPDATE auth.users SET encrypted_password = $1, updated_at = NOW() WHERE id = $2`, string(hash), userID); err != nil {
+			slog.Error("failed to update password", "error", err, "user_id", userID)
+			writeError(w, http.StatusInternalServerError, "failed to update password")
+			return
+		}
 	}
 
 	if req.Data != nil {
-		metaJSON, _ := json.Marshal(req.Data)
-		pool.Exec(ctx, `UPDATE auth.users SET raw_user_meta_data = $1, updated_at = NOW() WHERE id = $2`, string(metaJSON), userID)
+		metaJSON, err := json.Marshal(req.Data)
+		if err != nil {
+			slog.Error("failed to marshal user metadata", "error", err, "user_id", userID)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if _, err := tx.Exec(ctx, `UPDATE auth.users SET raw_user_meta_data = $1, updated_at = NOW() WHERE id = $2`, string(metaJSON), userID); err != nil {
+			slog.Error("failed to update user metadata", "error", err, "user_id", userID)
+			writeError(w, http.StatusInternalServerError, "failed to update user metadata")
+			return
+		}
 	}
 
 	if req.Email != "" {
 		newEmail := strings.ToLower(strings.TrimSpace(req.Email))
-		// Verify no other user has this email
+		if !isValidEmail(newEmail) {
+			writeError(w, http.StatusUnprocessableEntity, "invalid email format")
+			return
+		}
 		var exists bool
-		pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM auth.users WHERE email = $1 AND id != $2)`, newEmail, userID).Scan(&exists)
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM auth.users WHERE email = $1 AND id != $2)`, newEmail, userID).Scan(&exists); err != nil {
+			slog.Error("failed to check email uniqueness", "error", err, "user_id", userID)
+			writeError(w, http.StatusInternalServerError, "failed to check email")
+			return
+		}
 		if exists {
 			writeError(w, http.StatusBadRequest, "email already in use")
 			return
 		}
-		pool.Exec(ctx, `UPDATE auth.users SET email = $1, updated_at = NOW() WHERE id = $2`, newEmail, userID)
+		if _, err := tx.Exec(ctx, `UPDATE auth.users SET email = $1, updated_at = NOW() WHERE id = $2`, newEmail, userID); err != nil {
+			slog.Error("failed to update email", "error", err, "user_id", userID)
+			writeError(w, http.StatusInternalServerError, "failed to update email")
+			return
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to commit changes")
+		return
 	}
 
 	user, err := fetchUser(ctx, pool, userID)
@@ -617,7 +855,7 @@ func (h *Handler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, user)
+	httputil.WriteJSON(w, http.StatusOK, user)
 }
 
 // Logout handles POST /auth/v1/logout
@@ -636,20 +874,29 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req logoutRequest
+	// Intentionally ignoring decode error: empty/malformed body defaults to local scope logout.
 	json.NewDecoder(r.Body).Decode(&req)
 
 	ctx := r.Context()
 
 	if req.Scope == "global" {
 		// Revoke all sessions
-		pool.Exec(ctx, `DELETE FROM auth.sessions WHERE user_id = $1`, userID)
-		pool.Exec(ctx, `UPDATE auth.refresh_tokens SET revoked = true WHERE user_id = $1`, userID)
+		if _, err := pool.Exec(ctx, `DELETE FROM auth.sessions WHERE user_id = $1`, userID); err != nil {
+			slog.Error("failed to delete sessions on global logout", "error", err, "user_id", userID)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE auth.refresh_tokens SET revoked = true WHERE user_id = $1`, userID); err != nil {
+			slog.Error("failed to revoke refresh tokens on global logout", "error", err, "user_id", userID)
+		}
 	} else {
 		// Revoke current session only
 		sessionID, _ := extractSessionFromAuth(r, project.JWTSecret)
 		if sessionID != "" {
-			pool.Exec(ctx, `DELETE FROM auth.sessions WHERE id = $1`, sessionID)
-			pool.Exec(ctx, `UPDATE auth.refresh_tokens SET revoked = true WHERE session_id = $1`, sessionID)
+			if _, err := pool.Exec(ctx, `DELETE FROM auth.sessions WHERE id = $1`, sessionID); err != nil {
+				slog.Error("failed to delete session on logout", "error", err, "session_id", sessionID)
+			}
+			if _, err := pool.Exec(ctx, `UPDATE auth.refresh_tokens SET revoked = true WHERE session_id = $1`, sessionID); err != nil {
+				slog.Error("failed to revoke refresh tokens on logout", "error", err, "session_id", sessionID)
+			}
 		}
 	}
 
@@ -664,12 +911,16 @@ type sessionData struct {
 	accessToken  string
 	refreshToken string
 	expiresAt    int64
+	expiresIn    int
 }
 
 func createSessionAnonymous(ctx contextType, pool *pgxpool.Pool, project *database.ProjectRecord, userID string, userMeta, appMeta map[string]interface{}, r *http.Request) (*sessionData, error) {
 	var sessionID string
 	userAgent := r.Header.Get("User-Agent")
-	ip := r.RemoteAddr
+	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if ip == "" {
+		ip = r.RemoteAddr // fallback if no port
+	}
 	err := pool.QueryRow(ctx, `
 		INSERT INTO auth.sessions (user_id, user_agent, ip, aal)
 		VALUES ($1, $2, $3, 'aal1')
@@ -679,7 +930,7 @@ func createSessionAnonymous(ctx contextType, pool *pgxpool.Pool, project *databa
 		return nil, fmt.Errorf("create session: %w", err)
 	}
 
-	accessToken, expiresAt, err := generateUserJWTFull(project.JWTSecret, project.SiteURL, userID, "", userMeta, appMeta, sessionID, true, "anonymous")
+	accessToken, expiresAt, expiresAtTime, err := generateUserJWTFull(project.JWTSecret, project.SiteURL, userID, "", userMeta, appMeta, sessionID, true, "anonymous")
 	if err != nil {
 		return nil, fmt.Errorf("generate jwt: %w", err)
 	}
@@ -701,6 +952,7 @@ func createSessionAnonymous(ctx contextType, pool *pgxpool.Pool, project *databa
 		accessToken:  accessToken,
 		refreshToken: refreshToken,
 		expiresAt:    expiresAt,
+		expiresIn:    int(time.Until(expiresAtTime).Seconds()),
 	}, nil
 }
 
@@ -708,7 +960,10 @@ func createSession(ctx contextType, pool *pgxpool.Pool, project *database.Projec
 	// Create session record
 	var sessionID string
 	userAgent := r.Header.Get("User-Agent")
-	ip := r.RemoteAddr
+	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if ip == "" {
+		ip = r.RemoteAddr // fallback if no port
+	}
 	err := pool.QueryRow(ctx, `
 		INSERT INTO auth.sessions (user_id, user_agent, ip, aal)
 		VALUES ($1, $2, $3, 'aal1')
@@ -719,7 +974,7 @@ func createSession(ctx contextType, pool *pgxpool.Pool, project *database.Projec
 	}
 
 	// Generate access token
-	accessToken, expiresAt, err := generateUserJWT(project.JWTSecret, project.SiteURL, userID, email, userMeta, appMeta, sessionID)
+	accessToken, expiresAt, expiresAtTime, err := generateUserJWT(project.JWTSecret, project.SiteURL, userID, email, userMeta, appMeta, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("generate jwt: %w", err)
 	}
@@ -743,16 +998,18 @@ func createSession(ctx contextType, pool *pgxpool.Pool, project *database.Projec
 		accessToken:  accessToken,
 		refreshToken: refreshToken,
 		expiresAt:    expiresAt,
+		expiresIn:    int(time.Until(expiresAtTime).Seconds()),
 	}, nil
 }
 
-func generateUserJWT(jwtSecret, siteURL, userID, email string, userMeta, appMeta map[string]interface{}, sessionID string) (string, int64, error) {
+func generateUserJWT(jwtSecret, siteURL, userID, email string, userMeta, appMeta map[string]interface{}, sessionID string) (string, int64, time.Time, error) {
 	return generateUserJWTFull(jwtSecret, siteURL, userID, email, userMeta, appMeta, sessionID, false, "password")
 }
 
-func generateUserJWTFull(jwtSecret, siteURL, userID, email string, userMeta, appMeta map[string]interface{}, sessionID string, isAnonymous bool, amrMethod string) (string, int64, error) {
+func generateUserJWTFull(jwtSecret, siteURL, userID, email string, userMeta, appMeta map[string]interface{}, sessionID string, isAnonymous bool, amrMethod string) (string, int64, time.Time, error) {
 	now := time.Now()
-	expiresAt := now.Add(1 * time.Hour).Unix()
+	expiresAtTime := now.Add(1 * time.Hour)
+	expiresAt := expiresAtTime.Unix()
 
 	claims := jwt.MapClaims{
 		"aud":           "authenticated",
@@ -773,7 +1030,7 @@ func generateUserJWTFull(jwtSecret, siteURL, userID, email string, userMeta, app
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	signed, err := token.SignedString([]byte(jwtSecret))
-	return signed, expiresAt, err
+	return signed, expiresAt, expiresAtTime, err
 }
 
 func generateRefreshToken() (string, error) {
@@ -858,8 +1115,12 @@ func fetchUser(ctx contextType, pool *pgxpool.Pool, userID string) (*userRespons
 	}
 
 	var appMeta, userMeta map[string]interface{}
-	json.Unmarshal(rawAppMeta, &appMeta)
-	json.Unmarshal(rawUserMeta, &userMeta)
+	if err := json.Unmarshal(rawAppMeta, &appMeta); err != nil {
+		slog.Warn("failed to unmarshal app_metadata", "user_id", userID, "error", err)
+	}
+	if err := json.Unmarshal(rawUserMeta, &userMeta); err != nil {
+		slog.Warn("failed to unmarshal user_metadata", "user_id", userID, "error", err)
+	}
 
 	var emailConfStr, lastSignStr, confirmedStr *string
 	if emailConfirmedAt != nil {
@@ -949,12 +1210,6 @@ func fetchIdentities(ctx contextType, pool *pgxpool.Pool, userID string) []ident
 	return identities
 }
 
-func writeJSON(w http.ResponseWriter, status int, v interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
-}
-
 // AdminDeleteUser handles DELETE /auth/v1/admin/users/{id}
 // Requires service_role key. Deletes the user and all associated sessions/tokens.
 func (h *Handler) AdminDeleteUser(w http.ResponseWriter, r *http.Request) {
@@ -989,21 +1244,45 @@ func (h *Handler) AdminDeleteUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Delete refresh tokens, sessions, identities, then soft-delete user
-	_, _ = pool.Exec(ctx, `DELETE FROM auth.refresh_tokens WHERE user_id = $1`, userID)
-	_, _ = pool.Exec(ctx, `DELETE FROM auth.sessions WHERE user_id = $1`, userID)
-	_, _ = pool.Exec(ctx, `DELETE FROM auth.identities WHERE user_id = $1`, userID)
-	_, err = pool.Exec(ctx, `UPDATE auth.users SET deleted_at = NOW(), updated_at = NOW() WHERE id = $1`, userID)
+	// Delete refresh tokens, sessions, identities, then soft-delete user — atomically
+	tx, err := pool.Begin(ctx)
 	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to begin transaction")
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, `DELETE FROM auth.refresh_tokens WHERE user_id = $1`, userID); err != nil {
+		slog.Error("failed to delete refresh tokens", "error", err, "user_id", userID)
+		writeError(w, http.StatusInternalServerError, "failed to delete user")
+		return
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM auth.sessions WHERE user_id = $1`, userID); err != nil {
+		slog.Error("failed to delete sessions", "error", err, "user_id", userID)
+		writeError(w, http.StatusInternalServerError, "failed to delete user")
+		return
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM auth.identities WHERE user_id = $1`, userID); err != nil {
+		slog.Error("failed to delete identities", "error", err, "user_id", userID)
+		writeError(w, http.StatusInternalServerError, "failed to delete user")
+		return
+	}
+	if _, err := tx.Exec(ctx, `UPDATE auth.users SET deleted_at = NOW(), updated_at = NOW() WHERE id = $1`, userID); err != nil {
+		slog.Error("failed to soft-delete user", "error", err, "user_id", userID)
 		writeError(w, http.StatusInternalServerError, "failed to delete user")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{})
+	if err := tx.Commit(ctx); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to commit user deletion")
+		return
+	}
+
+	httputil.WriteJSON(w, http.StatusOK, map[string]interface{}{})
 }
 
 func writeError(w http.ResponseWriter, status int, message string) {
-	writeJSON(w, status, map[string]interface{}{
+	httputil.WriteJSON(w, status, map[string]interface{}{
 		"error":             message,
 		"error_description": message,
 	})

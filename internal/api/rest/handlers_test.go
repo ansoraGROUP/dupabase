@@ -3,15 +3,18 @@ package rest
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/ansoraGROUP/dupabase/internal/database"
+	"github.com/ansoraGROUP/dupabase/internal/httputil"
 	"github.com/ansoraGROUP/dupabase/internal/middleware"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // ---------------------------------------------------------------------------
@@ -377,7 +380,10 @@ func TestBuildWhereClause_NoFilters(t *testing.T) {
 		"offset": {"0"},
 	}
 
-	where, args := buildWhereClause(q, "public", "todos")
+	where, args, err := buildWhereClause(q, "public", "todos")
+	if err != nil {
+		t.Fatalf("buildWhereClause returned unexpected error: %v", err)
+	}
 	if where != "" {
 		t.Errorf("expected empty where clause, got %q", where)
 	}
@@ -392,7 +398,10 @@ func TestBuildWhereClause_WithFilters(t *testing.T) {
 		"select": {"*"},
 	}
 
-	where, args := buildWhereClause(q, "public", "todos")
+	where, args, err := buildWhereClause(q, "public", "todos")
+	if err != nil {
+		t.Fatalf("buildWhereClause returned unexpected error: %v", err)
+	}
 	if where == "" {
 		t.Fatal("expected non-empty where clause")
 	}
@@ -413,7 +422,10 @@ func TestBuildWhereClause_SkipsReservedParams(t *testing.T) {
 		"on_conflict": {"id"},
 	}
 
-	where, args := buildWhereClause(q, "public", "todos")
+	where, args, err := buildWhereClause(q, "public", "todos")
+	if err != nil {
+		t.Fatalf("buildWhereClause returned unexpected error: %v", err)
+	}
 	if where != "" {
 		t.Errorf("expected empty where clause for reserved params only, got %q", where)
 	}
@@ -428,7 +440,10 @@ func TestBuildWhereClause_MultipleFilters(t *testing.T) {
 		"visible": {"is.true"},
 	}
 
-	where, args := buildWhereClause(q, "public", "todos")
+	where, args, err := buildWhereClause(q, "public", "todos")
+	if err != nil {
+		t.Fatalf("buildWhereClause returned unexpected error: %v", err)
+	}
 	if !strings.Contains(where, "WHERE") {
 		t.Error("expected WHERE in clause")
 	}
@@ -568,7 +583,7 @@ func TestRestWriteError(t *testing.T) {
 
 func TestRestWriteJSON(t *testing.T) {
 	rec := httptest.NewRecorder()
-	writeJSON(rec, http.StatusOK, map[string]string{"ok": "true"})
+	httputil.WriteJSON(rec, http.StatusOK, map[string]string{"ok": "true"})
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("expected status 200, got %d", rec.Code)
@@ -745,5 +760,345 @@ func TestParseFilter_IsOperator_Unknown(t *testing.T) {
 	cond, _, _ := parseFilter("col", "is.unknown_value", 1)
 	if cond != "" {
 		t.Errorf("expected empty condition for unknown is value, got %q", cond)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// hasFilterParams
+// ---------------------------------------------------------------------------
+
+func TestHasFilterParams(t *testing.T) {
+	tests := []struct {
+		name   string
+		query  url.Values
+		expect bool
+	}{
+		{"no params", url.Values{}, false},
+		{"only select", url.Values{"select": {"*"}}, false},
+		{"only order", url.Values{"order": {"id.asc"}}, false},
+		{"only limit", url.Values{"limit": {"10"}}, false},
+		{"only offset", url.Values{"offset": {"5"}}, false},
+		{"only on_conflict", url.Values{"on_conflict": {"id"}}, false},
+		{"only columns", url.Values{"columns": {"id,name"}}, false},
+		{"all reserved", url.Values{
+			"select":      {"*"},
+			"order":       {"id.asc"},
+			"limit":       {"10"},
+			"offset":      {"0"},
+			"on_conflict": {"id"},
+			"columns":     {"id,name"},
+		}, false},
+		{"with filter", url.Values{"id": {"eq.1"}}, true},
+		{"select + filter", url.Values{"select": {"*"}, "name": {"eq.test"}}, true},
+		{"order + filter", url.Values{"order": {"id.asc"}, "status": {"eq.active"}}, true},
+		{"multiple filters", url.Values{"id": {"eq.1"}, "name": {"like.*test*"}}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasFilterParams(tt.query); got != tt.expect {
+				t.Errorf("hasFilterParams(%v) = %v, want %v", tt.query, got, tt.expect)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// isAllowedSchema
+// ---------------------------------------------------------------------------
+
+func TestIsAllowedSchema(t *testing.T) {
+	tests := []struct {
+		schema  string
+		allowed bool
+	}{
+		{"public", true},
+		{"auth", false},
+		{"pg_catalog", false},
+		{"information_schema", false},
+		{"platform", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.schema, func(t *testing.T) {
+			if got := isAllowedSchema(tt.schema); got != tt.allowed {
+				t.Errorf("isAllowedSchema(%q) = %v, want %v", tt.schema, got, tt.allowed)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// sanitizeDBError
+// ---------------------------------------------------------------------------
+
+func TestSanitizeDBError(t *testing.T) {
+	tests := []struct {
+		name     string
+		errMsg   string
+		expected string
+	}{
+		{"rls_violation", "ERROR: new row violates row-level security policy", "permission denied for this resource"},
+		{"unique_violation", "ERROR: duplicate key value violates unique constraint", "duplicate key value violates unique constraint"},
+		{"not_null_violation", "ERROR: null value in column \"name\" violates not-null constraint", "null value in column violates not-null constraint"},
+		{"fk_violation", "ERROR: insert or update violates foreign key constraint", "foreign key constraint violation"},
+		{"check_violation", "ERROR: new row violates check constraint", "check constraint violation"},
+		{"relation_not_found", `ERROR: relation "nonexistent" does not exist`, "Requested resource does not exist"},
+		{"permission_denied", "ERROR: permission denied for table users", "permission denied"},
+		{"generic_error", "ERROR: something completely unexpected happened", "database operation failed"},
+		{"connection_error", "failed to connect to database", "database operation failed"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeDBError(fmt.Errorf("%s", tt.errMsg))
+			if got != tt.expected {
+				t.Errorf("sanitizeDBError(%q) = %q, want %q", tt.errMsg, got, tt.expected)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// splitRespectingParens
+// ---------------------------------------------------------------------------
+
+func TestSplitRespectingParens(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected []string
+	}{
+		{"simple", "a,b,c", []string{"a", "b", "c"}},
+		{"with_parens", "id,posts(title,body),name", []string{"id", "posts(title,body)", "name"}},
+		{"nested_parens", "a(b(c)),d", []string{"a(b(c))", "d"}},
+		{"no_commas", "single", []string{"single"}},
+		{"empty", "", []string{""}},
+		{"trailing_comma", "a,b,", []string{"a", "b", ""}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := splitRespectingParens(tt.input)
+			if len(got) != len(tt.expected) {
+				t.Fatalf("got %d parts, want %d: %v", len(got), len(tt.expected), got)
+			}
+			for i := range got {
+				if got[i] != tt.expected[i] {
+					t.Errorf("part[%d]: got %q, want %q", i, got[i], tt.expected[i])
+				}
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// parseSelectWithEmbedding
+// ---------------------------------------------------------------------------
+
+func TestParseSelectWithEmbedding(t *testing.T) {
+	t.Run("star_only", func(t *testing.T) {
+		cols, embeds := parseSelectWithEmbedding("*")
+		if len(cols) != 1 || cols[0] != "*" {
+			t.Errorf("expected [*], got %v", cols)
+		}
+		if len(embeds) != 0 {
+			t.Errorf("expected no embeds, got %d", len(embeds))
+		}
+	})
+
+	t.Run("columns_and_embed", func(t *testing.T) {
+		cols, embeds := parseSelectWithEmbedding("id,name,posts(title,body)")
+		if len(cols) != 2 {
+			t.Fatalf("expected 2 cols, got %d: %v", len(cols), cols)
+		}
+		if len(embeds) != 1 {
+			t.Fatalf("expected 1 embed, got %d", len(embeds))
+		}
+		if embeds[0].table != "posts" {
+			t.Errorf("expected embed table 'posts', got %q", embeds[0].table)
+		}
+		if len(embeds[0].columns) != 2 {
+			t.Errorf("expected 2 embed columns, got %d", len(embeds[0].columns))
+		}
+	})
+
+	t.Run("inner_join_modifier", func(t *testing.T) {
+		_, embeds := parseSelectWithEmbedding("id,posts!inner(title)")
+		if len(embeds) != 1 {
+			t.Fatalf("expected 1 embed, got %d", len(embeds))
+		}
+		if !embeds[0].isInner {
+			t.Error("expected isInner=true for !inner modifier")
+		}
+	})
+
+	t.Run("alias_embed", func(t *testing.T) {
+		_, embeds := parseSelectWithEmbedding("my_posts:posts(title)")
+		if len(embeds) != 1 {
+			t.Fatalf("expected 1 embed, got %d", len(embeds))
+		}
+		if embeds[0].alias != "my_posts" {
+			t.Errorf("expected alias 'my_posts', got %q", embeds[0].alias)
+		}
+		if embeds[0].table != "posts" {
+			t.Errorf("expected table 'posts', got %q", embeds[0].table)
+		}
+	})
+
+	t.Run("empty_returns_star", func(t *testing.T) {
+		cols, embeds := parseSelectWithEmbedding("")
+		if len(cols) != 1 || cols[0] != "*" {
+			t.Errorf("expected [*] for empty input, got %v", cols)
+		}
+		if len(embeds) != 0 {
+			t.Errorf("expected no embeds for empty input, got %d", len(embeds))
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// quoteIdentDotted
+// ---------------------------------------------------------------------------
+
+func TestQuoteIdentDotted(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"column", `"column"`},
+		{"table.column", `"table"."column"`},
+		{"schema.table", `"schema"."table"`},
+		{"nodot", `"nodot"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := quoteIdentDotted(tt.input)
+			if got != tt.expected {
+				t.Errorf("quoteIdentDotted(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// buildWhereClause - unsupported logical operators
+// ---------------------------------------------------------------------------
+
+func TestBuildWhereClause_LogicalOperatorsRejected(t *testing.T) {
+	logicalOps := []string{"and", "or", "not.and", "not.or"}
+	for _, op := range logicalOps {
+		t.Run(op, func(t *testing.T) {
+			q := map[string][]string{
+				op: {"(id.eq.1,name.eq.test)"},
+			}
+			_, _, err := buildWhereClause(q, "public", "todos")
+			if err == nil {
+				t.Errorf("expected error for logical operator %q", op)
+			}
+			if !strings.Contains(err.Error(), "unsupported logical operator") {
+				t.Errorf("expected 'unsupported logical operator' in error, got: %v", err)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// extractTableName edge cases
+// ---------------------------------------------------------------------------
+
+func TestExtractTableName_EdgeCases(t *testing.T) {
+	tests := []struct {
+		path     string
+		expected string
+	}{
+		{"/rest/v1/", ""},
+		{"/rest/v1/a/b/c", ""},
+		{"/rest/v1/table-with-dashes", "table-with-dashes"},
+		{"/rest/v1/Table_123", "Table_123"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			got := extractTableName(tt.path)
+			if got != tt.expected {
+				t.Errorf("got %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// writeMaybeObject
+// ---------------------------------------------------------------------------
+
+func TestWriteMaybeObject_Array(t *testing.T) {
+	result := []map[string]interface{}{
+		{"id": 1, "name": "test"},
+		{"id": 2, "name": "test2"},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	rec := httptest.NewRecorder()
+
+	writeMaybeObject(rec, req, http.StatusOK, result)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", rec.Code)
+	}
+
+	var body []map[string]interface{}
+	json.NewDecoder(rec.Body).Decode(&body)
+	if len(body) != 2 {
+		t.Errorf("expected 2 items, got %d", len(body))
+	}
+}
+
+func TestWriteMaybeObject_SingleObject(t *testing.T) {
+	result := []map[string]interface{}{
+		{"id": 1, "name": "test"},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Accept", "application/vnd.pgrst.object+json")
+	rec := httptest.NewRecorder()
+
+	writeMaybeObject(rec, req, http.StatusOK, result)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", rec.Code)
+	}
+
+	var body map[string]interface{}
+	json.NewDecoder(rec.Body).Decode(&body)
+	if body["name"] != "test" {
+		t.Errorf("expected name 'test', got %v", body["name"])
+	}
+}
+
+func TestWriteMaybeObject_MultipleRowsWithSingleExpected(t *testing.T) {
+	result := []map[string]interface{}{
+		{"id": 1},
+		{"id": 2},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Accept", "application/vnd.pgrst.object+json")
+	rec := httptest.NewRecorder()
+
+	writeMaybeObject(rec, req, http.StatusOK, result)
+
+	if rec.Code != http.StatusNotAcceptable {
+		t.Errorf("expected status 406, got %d", rec.Code)
+	}
+}
+
+func TestWriteMaybeObject_EmptyResultWithSingleExpected(t *testing.T) {
+	result := []map[string]interface{}{}
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Accept", "application/vnd.pgrst.object+json")
+	rec := httptest.NewRecorder()
+
+	writeMaybeObject(rec, req, http.StatusOK, result)
+
+	if rec.Code != http.StatusNotAcceptable {
+		t.Errorf("expected status 406, got %d", rec.Code)
 	}
 }

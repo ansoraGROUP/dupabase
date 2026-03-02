@@ -1,7 +1,9 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 
@@ -22,9 +24,16 @@ type Config struct {
 	PlatformJWTExpiry int // seconds
 
 	// Pool Manager
-	MaxConnectionsPerDB int
+	MaxConnectionsPerDB  int
 	GlobalMaxConnections int
 	PoolIdleTimeout      int // seconds
+
+	// Platform pool
+	PlatformMaxConns int
+	PlatformMinConns int
+
+	// API keys
+	APIKeyExpiryDays int
 
 	// Default auth settings for new projects
 	DefaultEnableSignup      bool
@@ -41,10 +50,17 @@ type Config struct {
 	// Admin
 	AdminEmail    string
 	AdminPassword string
+
+	// Proxy
+	TrustProxy bool
 }
 
 func Load() (*Config, error) {
-	_ = godotenv.Load()
+	if err := godotenv.Load(); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("failed to load .env file", "error", err)
+		}
+	}
 
 	cfg := &Config{
 		Port:                     getEnvInt("PORT", 3000),
@@ -53,21 +69,43 @@ func Load() (*Config, error) {
 		DatabaseURL:              mustGetEnv("DATABASE_URL"),
 		PlatformJWTSecret:        mustGetEnv("PLATFORM_JWT_SECRET"),
 		PlatformJWTExpiry:        getEnvInt("PLATFORM_JWT_EXPIRY", 86400),
-		MaxConnectionsPerDB:     getEnvInt("MAX_CONNECTIONS_PER_DB", 5),
-		GlobalMaxConnections:    getEnvInt("GLOBAL_MAX_CONNECTIONS", 100),
+		MaxConnectionsPerDB:      getEnvInt("MAX_CONNECTIONS_PER_DB", 5),
+		GlobalMaxConnections:     getEnvInt("GLOBAL_MAX_CONNECTIONS", 100),
 		PoolIdleTimeout:          getEnvInt("POOL_IDLE_TIMEOUT_SECONDS", 300),
 		DefaultEnableSignup:      getEnvBool("DEFAULT_ENABLE_SIGNUP", true),
 		DefaultAutoconfirm:       getEnvBool("DEFAULT_AUTOCONFIRM", true),
 		DefaultPasswordMinLength: getEnvInt("DEFAULT_PASSWORD_MIN_LENGTH", 6),
+		PlatformMaxConns:         getEnvInt("PLATFORM_MAX_CONNECTIONS", 10),
+		PlatformMinConns:         getEnvInt("PLATFORM_MIN_CONNECTIONS", 2),
+		APIKeyExpiryDays:         getEnvInt("API_KEY_EXPIRY_DAYS", 365),
 		BackupEncryptionKey:      getEnv("BACKUP_ENCRYPTION_KEY", ""),
 		ImportMaxSizeMB:          getEnvInt("IMPORT_MAX_SIZE_MB", 500),
 		ImportTempDir:            getEnv("IMPORT_TEMP_DIR", "/tmp/imports"),
 		AdminEmail:               getEnv("ADMIN_EMAIL", ""),
 		AdminPassword:            getEnv("ADMIN_PASSWORD", ""),
+		TrustProxy:               getEnvBool("TRUST_PROXY", false),
 	}
 
 	if len(cfg.PlatformJWTSecret) < 32 {
 		return nil, fmt.Errorf("PLATFORM_JWT_SECRET must be at least 32 characters")
+	}
+
+	// Validate PORT
+	if cfg.Port < 1 || cfg.Port > 65535 {
+		return nil, fmt.Errorf("invalid PORT: %d (must be 1-65535)", cfg.Port)
+	}
+
+	// Validate connection config
+	if cfg.MaxConnectionsPerDB < 1 {
+		return nil, fmt.Errorf("MAX_CONNECTIONS_PER_DB must be >= 1, got %d", cfg.MaxConnectionsPerDB)
+	}
+	if cfg.GlobalMaxConnections < 1 {
+		return nil, fmt.Errorf("GLOBAL_MAX_CONNECTIONS must be >= 1, got %d", cfg.GlobalMaxConnections)
+	}
+
+	// Validate backup encryption key length
+	if cfg.BackupEncryptionKey != "" && len(cfg.BackupEncryptionKey) < 32 {
+		return nil, fmt.Errorf("BACKUP_ENCRYPTION_KEY must be at least 32 characters")
 	}
 
 	// Validate admin config: both or neither

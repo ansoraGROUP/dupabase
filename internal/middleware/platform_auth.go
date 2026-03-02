@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/ansoraGROUP/dupabase/internal/httputil"
 	"github.com/ansoraGROUP/dupabase/internal/platform"
 )
 
@@ -28,24 +29,24 @@ func (m *PlatformAuth) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
 		if auth == "" {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing authorization header"})
+			httputil.WriteJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing authorization header"})
 			return
 		}
 
 		token := strings.TrimPrefix(auth, "Bearer ")
 		if token == auth {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid authorization format"})
+			httputil.WriteJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid authorization format"})
 			return
 		}
 
-		claims, err := m.authService.ValidateToken(token)
+		claims, err := m.authService.ValidateToken(r.Context(), token)
 		if err != nil {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid or expired token"})
+			httputil.WriteJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid or expired token"})
 			return
 		}
 
 		if claims.Type != "platform" {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid token type"})
+			httputil.WriteJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid token type"})
 			return
 		}
 

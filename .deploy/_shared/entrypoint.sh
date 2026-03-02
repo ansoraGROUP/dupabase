@@ -6,8 +6,18 @@ cd /app/dashboard
 HOSTNAME=0.0.0.0 PORT=3000 node server.js &
 NEXT_PID=$!
 
-# Wait briefly for Next.js to start
-sleep 2
+# Wait for Next.js to be ready
+echo "Waiting for Next.js to start..."
+for i in $(seq 1 30); do
+  if wget -q --spider http://localhost:3000 2>/dev/null; then
+    echo "Next.js is ready"
+    break
+  fi
+  if [ "$i" -eq 30 ]; then
+    echo "WARNING: Next.js did not respond after 30 seconds, starting Go server anyway"
+  fi
+  sleep 1
+done
 
 # Start Go server (port 3333, proxies non-API routes to Next.js)
 cd /app

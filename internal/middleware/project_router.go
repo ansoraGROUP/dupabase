@@ -5,16 +5,17 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/ansoraGROUP/dupabase/internal/database"
+	"github.com/ansoraGROUP/dupabase/internal/httputil"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/ansoraGROUP/dupabase/internal/database"
 )
 
 type projectContextKey string
 
 const (
-	ContextProject    projectContextKey = "project"
-	ContextProjectSQL projectContextKey = "project_sql"
+	ContextProject      projectContextKey = "project"
+	ContextProjectSQL   projectContextKey = "project_sql"
 	ContextAPIKeyClaims projectContextKey = "apikey_claims"
 	ContextAPIKeyRole   projectContextKey = "apikey_role"
 )
@@ -33,7 +34,7 @@ func (m *ProjectRouter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		apikey := r.Header.Get("apikey")
 		if apikey == "" {
-			writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
+			httputil.WriteJSON(w, http.StatusUnauthorized, map[string]interface{}{
 				"code":    "PGRST301",
 				"message": "Missing apikey header",
 			})
@@ -45,7 +46,7 @@ func (m *ProjectRouter) Middleware(next http.Handler) http.Handler {
 		unverified := jwt.MapClaims{}
 		_, _, err := parser.ParseUnverified(apikey, unverified)
 		if err != nil {
-			writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
+			httputil.WriteJSON(w, http.StatusUnauthorized, map[string]interface{}{
 				"code":    "PGRST301",
 				"message": "Invalid API key format",
 			})
@@ -54,7 +55,7 @@ func (m *ProjectRouter) Middleware(next http.Handler) http.Handler {
 
 		projectID, ok := unverified["project_id"].(string)
 		if !ok || projectID == "" {
-			writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
+			httputil.WriteJSON(w, http.StatusUnauthorized, map[string]interface{}{
 				"code":    "PGRST301",
 				"message": "API key missing project_id claim",
 			})
@@ -64,7 +65,7 @@ func (m *ProjectRouter) Middleware(next http.Handler) http.Handler {
 		// Look up the project
 		project, err := m.poolManager.GetProject(r.Context(), projectID)
 		if err != nil || project == nil {
-			writeJSON(w, http.StatusNotFound, map[string]interface{}{
+			httputil.WriteJSON(w, http.StatusNotFound, map[string]interface{}{
 				"code":    "PGRST301",
 				"message": "Project not found or inactive",
 			})
@@ -79,7 +80,7 @@ func (m *ProjectRouter) Middleware(next http.Handler) http.Handler {
 			return []byte(project.JWTSecret), nil
 		})
 		if err != nil || !verified.Valid {
-			writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
+			httputil.WriteJSON(w, http.StatusUnauthorized, map[string]interface{}{
 				"code":    "PGRST301",
 				"message": "Invalid API key",
 			})
@@ -95,7 +96,7 @@ func (m *ProjectRouter) Middleware(next http.Handler) http.Handler {
 		// Get database connection pool for this project
 		pool, err := m.poolManager.GetPool(r.Context(), projectID)
 		if err != nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+			httputil.WriteJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
 				"code":    "PGRST503",
 				"message": "Database connection unavailable",
 			})

@@ -98,7 +98,7 @@ func TestGetEnvBool_TrueValues(t *testing.T) {
 		{"false", false},
 		{"0", false},
 		{"yes", false},  // only "true" and "1" are true
-		{"TRUE", false},  // case sensitive
+		{"TRUE", false}, // case sensitive
 	}
 
 	for _, tt := range tests {
@@ -293,8 +293,8 @@ func TestConfig_StructFields(t *testing.T) {
 		DatabaseURL:              "postgresql://user:pass@localhost:5432/db",
 		PlatformJWTSecret:        "secret",
 		PlatformJWTExpiry:        86400,
-		MaxConnectionsPerDB:     5,
-		GlobalMaxConnections:    100,
+		MaxConnectionsPerDB:      5,
+		GlobalMaxConnections:     100,
 		PoolIdleTimeout:          300,
 		DefaultEnableSignup:      true,
 		DefaultAutoconfirm:       true,

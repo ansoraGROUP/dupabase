@@ -3,6 +3,7 @@ package platform
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 
@@ -17,8 +18,14 @@ type CredentialService struct {
 
 func NewCredentialService(db *pgxpool.Pool, databaseURL string) *CredentialService {
 	// Parse DATABASE_URL to extract host/port for user display
-	parsed, _ := url.Parse(databaseURL)
-	base := fmt.Sprintf("%s:%s", parsed.Hostname(), parsed.Port())
+	var base string
+	parsed, err := url.Parse(databaseURL)
+	if err != nil {
+		slog.Error("failed to parse DATABASE_URL", "error", err)
+		base = ":"
+	} else {
+		base = fmt.Sprintf("%s:%s", parsed.Hostname(), parsed.Port())
+	}
 
 	return &CredentialService{db: db, baseURL: base}
 }
@@ -69,7 +76,16 @@ func (s *CredentialService) RevealCredentials(ctx context.Context, userID string
 		return nil, http.StatusInternalServerError, fmt.Errorf("decrypt failed: %w", err)
 	}
 
-	parsed, _ := url.Parse("postgresql://" + s.baseURL)
+	parsed, err := url.Parse("postgresql://" + s.baseURL)
+	if err != nil {
+		slog.Error("failed to parse credential base URL", "error", err, "baseURL", s.baseURL)
+		return &CredentialResponse{
+			PgUsername: pgUsername,
+			PgPassword: pgPassword,
+			PgHost:     "",
+			PgPort:     "",
+		}, http.StatusOK, nil
+	}
 
 	return &CredentialResponse{
 		PgUsername: pgUsername,

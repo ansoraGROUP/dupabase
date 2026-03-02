@@ -25,7 +25,7 @@ func TestGenerateRandomPassword_Length(t *testing.T) {
 }
 
 func TestGenerateRandomPassword_CharsetOnly(t *testing.T) {
-	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*"
 	pw, err := GenerateRandomPassword(1000)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

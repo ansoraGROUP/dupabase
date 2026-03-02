@@ -8,9 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ansoraGROUP/dupabase/internal/database"
+	"github.com/ansoraGROUP/dupabase/internal/httputil"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/ansoraGROUP/dupabase/internal/database"
 )
 
 // ---------------------------------------------------------------------------
@@ -299,7 +300,7 @@ func TestContextKeys_AreDistinct(t *testing.T) {
 
 func TestWriteJSON(t *testing.T) {
 	rec := httptest.NewRecorder()
-	writeJSON(rec, http.StatusTeapot, map[string]string{"hello": "world"})
+	httputil.WriteJSON(rec, http.StatusTeapot, map[string]string{"hello": "world"})
 
 	if rec.Code != http.StatusTeapot {
 		t.Errorf("expected status %d, got %d", http.StatusTeapot, rec.Code)

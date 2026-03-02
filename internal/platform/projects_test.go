@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/ansoraGROUP/dupabase/internal/database"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // ---------------------------------------------------------------------------
@@ -18,7 +18,7 @@ func TestGenerateProjectAPIKey_Anon(t *testing.T) {
 	secret := "test-jwt-secret-for-project-keys-long-enough"
 	projectID := "proj-abc-123"
 
-	tokenStr, err := generateProjectAPIKey(secret, projectID, "anon")
+	tokenStr, err := generateProjectAPIKey(secret, projectID, "anon", 365)
 	if err != nil {
 		t.Fatalf("generateProjectAPIKey failed: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestGenerateProjectAPIKey_ServiceRole(t *testing.T) {
 	secret := "test-jwt-secret-for-project-keys-long-enough"
 	projectID := "proj-xyz-789"
 
-	tokenStr, err := generateProjectAPIKey(secret, projectID, "service_role")
+	tokenStr, err := generateProjectAPIKey(secret, projectID, "service_role", 365)
 	if err != nil {
 		t.Fatalf("generateProjectAPIKey failed: %v", err)
 	}
@@ -87,8 +87,8 @@ func TestGenerateProjectAPIKey_DifferentSecrets(t *testing.T) {
 	secret1 := "secret-one-for-testing-long-enough-32chars"
 	secret2 := "secret-two-for-testing-long-enough-32chars"
 
-	token1, _ := generateProjectAPIKey(secret1, "proj-1", "anon")
-	token2, _ := generateProjectAPIKey(secret2, "proj-1", "anon")
+	token1, _ := generateProjectAPIKey(secret1, "proj-1", "anon", 365)
+	token2, _ := generateProjectAPIKey(secret2, "proj-1", "anon", 365)
 
 	if token1 == token2 {
 		t.Fatal("tokens with different secrets should not be identical")
@@ -148,9 +148,10 @@ func TestProjectMigrations_SQLContainsAuthSchema(t *testing.T) {
 
 func TestCreateProject_EmptyName(t *testing.T) {
 	svc := &ProjectService{
-		platformDB:  nil,
-		poolManager: nil,
-		siteURL:     "http://localhost:3000",
+		platformDB:       nil,
+		poolManager:      nil,
+		siteURL:          "http://localhost:3000",
+		apiKeyExpiryDays: 365,
 	}
 
 	_, status, err := svc.CreateProject(nil, "user-1", CreateProjectRequest{Name: ""})
@@ -167,9 +168,10 @@ func TestCreateProject_EmptyName(t *testing.T) {
 
 func TestCreateProject_WhitespaceOnlyName(t *testing.T) {
 	svc := &ProjectService{
-		platformDB:  nil,
-		poolManager: nil,
-		siteURL:     "http://localhost:3000",
+		platformDB:       nil,
+		poolManager:      nil,
+		siteURL:          "http://localhost:3000",
+		apiKeyExpiryDays: 365,
 	}
 
 	_, status, err := svc.CreateProject(nil, "user-1", CreateProjectRequest{Name: "   "})

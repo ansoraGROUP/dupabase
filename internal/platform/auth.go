@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"net/mail"
 	"regexp"
 	"strings"
 	"sync"
@@ -34,6 +36,8 @@ type AuthService struct {
 	jwtExpiry     time.Duration
 	loginAttempts map[string]*loginAttempt
 	attemptsMu    sync.Mutex
+	cleanupStop   chan struct{}
+	cleanupWg     sync.WaitGroup
 }
 
 type loginAttempt struct {
@@ -47,7 +51,39 @@ func NewAuthService(db *pgxpool.Pool, jwtSecret string, jwtExpiry int) *AuthServ
 		jwtSecret:     []byte(jwtSecret),
 		jwtExpiry:     time.Duration(jwtExpiry) * time.Second,
 		loginAttempts: make(map[string]*loginAttempt),
+		cleanupStop:   make(chan struct{}),
 	}
+}
+
+// StartCleanup starts a background goroutine that periodically removes expired login attempts.
+func (s *AuthService) StartCleanup() {
+	s.cleanupWg.Add(1)
+	go func() {
+		defer s.cleanupWg.Done()
+		ticker := time.NewTicker(15 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				s.attemptsMu.Lock()
+				now := time.Now()
+				for email, a := range s.loginAttempts {
+					if a.count >= 5 && now.Sub(a.lockedAt) >= 15*time.Minute {
+						delete(s.loginAttempts, email)
+					}
+				}
+				s.attemptsMu.Unlock()
+			case <-s.cleanupStop:
+				return
+			}
+		}
+	}()
+}
+
+// StopCleanup signals the cleanup goroutine to stop and waits for it to finish.
+func (s *AuthService) StopCleanup() {
+	close(s.cleanupStop)
+	s.cleanupWg.Wait()
 }
 
 type RegisterRequest struct {
@@ -88,8 +124,14 @@ func (s *AuthService) Register(ctx context.Context, req RegisterRequest) (*AuthR
 	if email == "" || req.Password == "" {
 		return nil, http.StatusBadRequest, fmt.Errorf("email and password are required")
 	}
+	if _, err := mail.ParseAddress(email); err != nil {
+		return nil, http.StatusBadRequest, fmt.Errorf("invalid email format")
+	}
 	if len(req.Password) < 8 {
 		return nil, http.StatusBadRequest, fmt.Errorf("password must be at least 8 characters")
+	}
+	if len(req.Password) > 72 {
+		return nil, http.StatusBadRequest, fmt.Errorf("password must not exceed 72 characters")
 	}
 
 	// Check registration mode
@@ -228,8 +270,11 @@ func (s *AuthService) Register(ctx context.Context, req RegisterRequest) (*AuthR
 		return nil, http.StatusInternalServerError, fmt.Errorf("commit: %w", err)
 	}
 
+	// Auto-create personal organization for the new user
+	s.createPersonalOrg(ctx, userID)
+
 	// Generate JWT
-	token, err := s.generateToken(userID, email)
+	token, err := s.generateToken(ctx, userID, email)
 	if err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("generate token: %w", err)
 	}
@@ -249,7 +294,15 @@ func (s *AuthService) Register(ctx context.Context, req RegisterRequest) (*AuthR
 
 // dummyHash is a pre-computed bcrypt hash used for timing-safe login.
 // When user is not found, we still run bcrypt comparison to prevent timing attacks.
-var dummyHash, _ = bcrypt.GenerateFromPassword([]byte("timing-safe-dummy-password-placeholder"), 12)
+var dummyHash []byte
+
+func init() {
+	var err error
+	dummyHash, err = bcrypt.GenerateFromPassword([]byte("timing-safe-dummy-password-placeholder"), bcrypt.DefaultCost)
+	if err != nil {
+		panic("failed to generate dummy bcrypt hash: " + err.Error())
+	}
+}
 
 // Login authenticates a platform user and returns a JWT.
 func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*AuthResponse, int, error) {
@@ -313,7 +366,7 @@ func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*AuthRespons
 		pgUsername = ""
 	}
 
-	token, err := s.generateToken(userID, email)
+	token, err := s.generateToken(ctx, userID, email)
 	if err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("generate token: %w", err)
 	}
@@ -388,6 +441,13 @@ func (s *AuthService) EnsureAdmin(ctx context.Context, email, password string) e
 func (s *AuthService) registerInternal(ctx context.Context, req RegisterRequest, asAdmin bool) (*AuthResponse, int, error) {
 	email := strings.ToLower(strings.TrimSpace(req.Email))
 
+	if _, err := mail.ParseAddress(email); err != nil {
+		return nil, http.StatusBadRequest, fmt.Errorf("invalid email format")
+	}
+	if len(req.Password) > 72 {
+		return nil, http.StatusBadRequest, fmt.Errorf("password must not exceed 72 characters")
+	}
+
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), 12)
 	if err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("hash password: %w", err)
@@ -459,7 +519,10 @@ func (s *AuthService) registerInternal(ctx context.Context, req RegisterRequest,
 		return nil, http.StatusInternalServerError, fmt.Errorf("commit: %w", err)
 	}
 
-	token, err := s.generateToken(userID, email)
+	// Auto-create personal organization for the new user
+	s.createPersonalOrg(ctx, userID)
+
+	token, err := s.generateToken(ctx, userID, email)
 	if err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("generate token: %w", err)
 	}
@@ -467,18 +530,20 @@ func (s *AuthService) registerInternal(ctx context.Context, req RegisterRequest,
 	return &AuthResponse{
 		Token: token,
 		User: PlatformUser{
-			ID:        userID,
-			Email:     email,
+			ID:         userID,
+			Email:      email,
 			PgUsername: pgUsername,
-			IsAdmin:   asAdmin,
-			CreatedAt: createdAt,
+			IsAdmin:    asAdmin,
+			CreatedAt:  createdAt,
 		},
 	}, http.StatusCreated, nil
 }
 
 // ValidateToken verifies a platform JWT and returns the claims.
-func (s *AuthService) ValidateToken(tokenString string) (*PlatformClaims, error) {
-	token, err := jwt.ParseWithClaims(tokenString, &PlatformClaims{}, func(t *jwt.Token) (interface{}, error) {
+// It also checks the token_version claim against the database to
+// detect tokens that were invalidated by a password change.
+func (s *AuthService) ValidateToken(ctx context.Context, tokenString string) (*PlatformClaims, error) {
+	token, err := jwt.Parse(tokenString, func(t *jwt.Token) (interface{}, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
@@ -488,9 +553,34 @@ func (s *AuthService) ValidateToken(tokenString string) (*PlatformClaims, error)
 		return nil, err
 	}
 
-	claims, ok := token.Claims.(*PlatformClaims)
+	mapClaims, ok := token.Claims.(jwt.MapClaims)
 	if !ok || !token.Valid {
 		return nil, fmt.Errorf("invalid token")
+	}
+
+	// Build PlatformClaims from map
+	claims := &PlatformClaims{}
+	if sub, _ := mapClaims["sub"].(string); sub != "" {
+		claims.Subject = sub
+	}
+	if email, _ := mapClaims["email"].(string); email != "" {
+		claims.Email = email
+	}
+	if typ, _ := mapClaims["type"].(string); typ != "" {
+		claims.Type = typ
+	}
+	if iss, _ := mapClaims["iss"].(string); iss != "" {
+		claims.Issuer = iss
+	}
+
+	// Check token_version to detect revoked tokens
+	if tv, exists := mapClaims["tv"]; exists && s.db != nil {
+		tvFloat, _ := tv.(float64)
+		var currentTV int
+		err := s.db.QueryRow(ctx, `SELECT token_version FROM platform.users WHERE id = $1`, claims.Subject).Scan(&currentTV)
+		if err == nil && int(tvFloat) != currentTV {
+			return nil, fmt.Errorf("token revoked")
+		}
 	}
 
 	return claims, nil
@@ -501,87 +591,140 @@ type ChangePasswordRequest struct {
 	NewPassword     string `json:"new_password"`
 }
 
+type ChangePasswordResponse struct {
+	Message string `json:"message"`
+	Token   string `json:"token"`
+}
+
 // ChangePassword updates the platform password and re-encrypts the PG password.
-func (s *AuthService) ChangePassword(ctx context.Context, userID string, req ChangePasswordRequest) (int, error) {
+// Returns a new JWT token so the old one is implicitly invalidated.
+func (s *AuthService) ChangePassword(ctx context.Context, userID string, req ChangePasswordRequest) (*ChangePasswordResponse, int, error) {
 	if req.CurrentPassword == "" || req.NewPassword == "" {
-		return http.StatusBadRequest, fmt.Errorf("current_password and new_password are required")
+		return nil, http.StatusBadRequest, fmt.Errorf("current_password and new_password are required")
 	}
 	if len(req.NewPassword) < 8 {
-		return http.StatusBadRequest, fmt.Errorf("new password must be at least 8 characters")
+		return nil, http.StatusBadRequest, fmt.Errorf("new password must be at least 8 characters")
+	}
+	if len(req.NewPassword) > 72 {
+		return nil, http.StatusBadRequest, fmt.Errorf("new password must not exceed 72 characters")
 	}
 
-	// Get current password hash
-	var passwordHash string
-	err := s.db.QueryRow(ctx, `SELECT password_hash FROM platform.users WHERE id = $1`, userID).Scan(&passwordHash)
+	// Begin transaction first to prevent TOCTOU race conditions
+	tx, err := s.db.Begin(ctx)
 	if err != nil {
-		return http.StatusNotFound, fmt.Errorf("user not found")
+		return nil, http.StatusInternalServerError, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Get current password hash and email inside the transaction with FOR UPDATE lock
+	var passwordHash, email string
+	err = tx.QueryRow(ctx, `SELECT password_hash, email FROM platform.users WHERE id = $1 FOR UPDATE`, userID).Scan(&passwordHash, &email)
+	if err != nil {
+		return nil, http.StatusNotFound, fmt.Errorf("user not found")
 	}
 
 	// Verify current password
 	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.CurrentPassword)); err != nil {
-		return http.StatusUnauthorized, fmt.Errorf("current password is incorrect")
+		return nil, http.StatusUnauthorized, fmt.Errorf("current password is incorrect")
 	}
 
 	// Hash new password
 	newHash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), 12)
 	if err != nil {
-		return http.StatusInternalServerError, fmt.Errorf("hash password: %w", err)
+		return nil, http.StatusInternalServerError, fmt.Errorf("hash password: %w", err)
 	}
 
 	// Decrypt PG password with current password, re-encrypt with new password
 	var pgEncrypted string
-	err = s.db.QueryRow(ctx, `SELECT pg_password_encrypted FROM platform.pg_users WHERE user_id = $1`, userID).Scan(&pgEncrypted)
+	err = tx.QueryRow(ctx, `SELECT pg_password_encrypted FROM platform.pg_users WHERE user_id = $1`, userID).Scan(&pgEncrypted)
 	if err != nil {
-		return http.StatusInternalServerError, fmt.Errorf("get pg credentials: %w", err)
+		return nil, http.StatusInternalServerError, fmt.Errorf("get pg credentials: %w", err)
 	}
 
 	pgPassword, err := DecryptPgPassword(pgEncrypted, req.CurrentPassword)
 	if err != nil {
-		return http.StatusInternalServerError, fmt.Errorf("decrypt pg password: %w", err)
+		return nil, http.StatusInternalServerError, fmt.Errorf("decrypt pg password: %w", err)
 	}
 
 	newPgEncrypted, err := EncryptPgPassword(pgPassword, req.NewPassword)
 	if err != nil {
-		return http.StatusInternalServerError, fmt.Errorf("re-encrypt pg password: %w", err)
+		return nil, http.StatusInternalServerError, fmt.Errorf("re-encrypt pg password: %w", err)
 	}
 
-	// Update both in a transaction
-	tx, err := s.db.Begin(ctx)
-	if err != nil {
-		return http.StatusInternalServerError, fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
+	// Update password
 	_, err = tx.Exec(ctx, `UPDATE platform.users SET password_hash = $1, updated_at = NOW() WHERE id = $2`, string(newHash), userID)
 	if err != nil {
-		return http.StatusInternalServerError, fmt.Errorf("update password: %w", err)
+		return nil, http.StatusInternalServerError, fmt.Errorf("update password: %w", err)
 	}
 
 	_, err = tx.Exec(ctx, `UPDATE platform.pg_users SET pg_password_encrypted = $1 WHERE user_id = $2`, newPgEncrypted, userID)
 	if err != nil {
-		return http.StatusInternalServerError, fmt.Errorf("update pg encryption: %w", err)
+		return nil, http.StatusInternalServerError, fmt.Errorf("update pg encryption: %w", err)
+	}
+
+	// Increment token_version to invalidate all existing tokens
+	_, err = tx.Exec(ctx, `UPDATE platform.users SET token_version = token_version + 1 WHERE id = $1`, userID)
+	if err != nil {
+		return nil, http.StatusInternalServerError, fmt.Errorf("increment token version: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return http.StatusInternalServerError, fmt.Errorf("commit: %w", err)
+		return nil, http.StatusInternalServerError, fmt.Errorf("commit: %w", err)
 	}
 
-	return http.StatusOK, nil
+	// Generate a new JWT so the caller can use it going forward,
+	// with the updated token_version.
+	token, err := s.generateToken(ctx, userID, email)
+	if err != nil {
+		return nil, http.StatusInternalServerError, fmt.Errorf("generate token: %w", err)
+	}
+
+	return &ChangePasswordResponse{
+		Message: "password changed successfully",
+		Token:   token,
+	}, http.StatusOK, nil
 }
 
-func (s *AuthService) generateToken(userID, email string) (string, error) {
+func (s *AuthService) generateToken(ctx context.Context, userID, email string) (string, error) {
+	// Fetch token_version for JWT invalidation
+	var tokenVersion int
+	if s.db != nil {
+		_ = s.db.QueryRow(ctx, `SELECT token_version FROM platform.users WHERE id = $1`, userID).Scan(&tokenVersion)
+	}
+
 	now := time.Now()
-	claims := PlatformClaims{
-		Email: email,
-		Type:  "platform",
-		RegisteredClaims: jwt.RegisteredClaims{
-			Subject:   userID,
-			IssuedAt:  jwt.NewNumericDate(now),
-			ExpiresAt: jwt.NewNumericDate(now.Add(s.jwtExpiry)),
-			Issuer:    "dupabase",
-		},
+	claims := jwt.MapClaims{
+		"sub":   userID,
+		"email": email,
+		"type":  "platform",
+		"iat":   now.Unix(),
+		"exp":   now.Add(s.jwtExpiry).Unix(),
+		"iss":   "dupabase",
+		"tv":    tokenVersion,
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString(s.jwtSecret)
+}
+
+// createPersonalOrg creates a "Personal" organization for a newly registered user.
+// This is non-fatal: if it fails, the user still works and migration 008 can backfill.
+func (s *AuthService) createPersonalOrg(ctx context.Context, userID string) {
+	var orgID string
+	err := s.db.QueryRow(ctx, `
+		INSERT INTO platform.organizations (name, slug, created_by)
+		VALUES ('Personal', $1, $2)
+		RETURNING id
+	`, "personal-"+userID, userID).Scan(&orgID)
+	if err != nil {
+		slog.Warn("failed to create personal org", "error", err, "user_id", userID)
+		return
+	}
+	_, err = s.db.Exec(ctx, `
+		INSERT INTO platform.org_members (org_id, user_id, role)
+		VALUES ($1, $2, 'owner')
+	`, orgID, userID)
+	if err != nil {
+		slog.Warn("failed to add user to personal org", "error", err, "user_id", userID)
+	}
 }

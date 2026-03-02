@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -38,9 +37,48 @@ func NewImportService(db *pgxpool.Pool, databaseURL string) *ImportService {
 
 // ImportOptions controls import behavior.
 type ImportOptions struct {
-	CleanImport     bool `json:"clean_import"`
-	SkipAuthSchema  bool `json:"skip_auth_schema"`
-	DisableTriggers bool `json:"disable_triggers"`
+	CleanImport      bool `json:"clean_import"`
+	SkipAuthSchema   bool `json:"skip_auth_schema"`
+	DisableTriggers  bool `json:"disable_triggers"`
+	MigrateAuthUsers bool `json:"migrate_auth_users"`
+}
+
+// DumpAnalysis contains the results of analyzing a database dump file.
+type DumpAnalysis struct {
+	IsSupabaseDump    bool     `json:"is_supabase_dump"`
+	Format            string   `json:"format"`
+	HasAuthUsers      bool     `json:"has_auth_users"`
+	HasMigrations     bool     `json:"has_migrations"`
+	SupabaseSchemas   []string `json:"supabase_schemas"`
+	DetectedSignals   []string `json:"detected_signals"`
+	RecommendedAction string   `json:"recommended_action"`
+}
+
+// supabaseSignatures are strings that indicate a Supabase dump.
+var supabaseSignatures = []struct {
+	pattern string
+	signal  string
+}{
+	{"supabase_migrations", "supabase_migrations schema"},
+	{"supabase_admin", "supabase_admin role"},
+	{"supabase_auth_admin", "supabase_auth_admin role"},
+	{"supabase_storage_admin", "supabase_storage_admin role"},
+	{"authenticator", "authenticator role"},
+	{"CREATE SCHEMA IF NOT EXISTS auth", "auth schema creation"},
+	{"auth.users", "auth.users table"},
+	{"auth.sessions", "auth.sessions table"},
+	{"auth.refresh_tokens", "auth.refresh_tokens table"},
+	{"extensions.uuid-ossp", "uuid-ossp extension"},
+	{"pgsodium", "pgsodium schema"},
+	{"supabase_functions", "supabase_functions schema"},
+	{"realtime", "realtime schema"},
+	{"graphql_public", "graphql_public schema"},
+	{"storage.objects", "storage.objects table"},
+}
+
+var supabaseSchemaNames = []string{
+	"auth", "extensions", "supabase_functions", "graphql", "graphql_public",
+	"realtime", "_realtime", "storage", "vault", "pgsodium",
 }
 
 // ImportTaskResponse is the public-facing import task record.
@@ -82,7 +120,12 @@ var sqlFilterPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)^\s*SET\s+.*search_path\s*=.*\bauth\b`),
 }
 
-// TOC filter patterns for custom dump format
+// TOC filter patterns for custom dump format.
+// These match against pg_restore --list output where schema names are
+// space-separated fields (e.g., "TABLE auth users postgres"), not
+// dot-qualified identifiers, so we use \b word boundaries.
+// NOTE: The SQL filter does not handle backslash continuation lines.
+// Multi-line statements split with \ may not be filtered correctly.
 var tocFilterPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\bauth\b`),
 	regexp.MustCompile(`(?i)\bextensions\b`),
@@ -92,14 +135,15 @@ var tocFilterPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\bCREATE EXTENSION\b`),
 }
 
-// StartImport validates ownership, saves metadata, and launches async import.
+// StartImport validates the project exists and is active, saves metadata, and launches async import.
+// Access control is handled at the router level via org membership.
 func (s *ImportService) StartImport(ctx context.Context, userID, projectID, filePath, fileName string, fileSize int64, opts ImportOptions) (*ImportTaskResponse, int, error) {
-	// Validate project ownership
+	// Validate project exists and is active (org access checked by router)
 	var dbName string
 	err := s.db.QueryRow(ctx, `
 		SELECT db_name FROM platform.projects
-		WHERE id = $1 AND user_id = $2 AND status = 'active'
-	`, projectID, userID).Scan(&dbName)
+		WHERE id = $1 AND status = 'active'
+	`, projectID).Scan(&dbName)
 	if err != nil {
 		return nil, http.StatusNotFound, fmt.Errorf("project not found or not active")
 	}
@@ -210,20 +254,27 @@ func (s *ImportService) CancelImport(ctx context.Context, userID string, taskID 
 		return http.StatusBadRequest, fmt.Errorf("import is not running (status: %s)", status)
 	}
 
-	// Kill process if exists
+	// Kill process if exists — copy the process pointer while holding the lock
+	// to avoid a race where the process finishes between Unlock and Kill.
 	s.mu.Lock()
 	cmd, ok := s.processes[taskID]
+	var proc *os.Process
+	if ok && cmd.Process != nil {
+		proc = cmd.Process
+	}
 	s.mu.Unlock()
 
-	if ok && cmd.Process != nil {
-		_ = cmd.Process.Kill()
+	if proc != nil {
+		_ = proc.Kill()
 	}
 
-	s.db.Exec(ctx, `
+	if _, err := s.db.Exec(ctx, `
 		UPDATE platform.import_tasks
 		SET status = 'cancelled', completed_at = NOW()
 		WHERE id = $1
-	`, taskID)
+	`, taskID); err != nil {
+		slog.Error("failed to mark import as cancelled", "task_id", taskID, "error", err)
+	}
 
 	return http.StatusOK, nil
 }
@@ -232,7 +283,9 @@ func (s *ImportService) CancelImport(ctx context.Context, userID string, taskID 
 
 // executeImport runs the actual import in a goroutine.
 func (s *ImportService) executeImport(taskID int64, dbName, filePath, format string, opts ImportOptions) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
+	defer cancel()
+	defer os.Remove(filePath)
 
 	defer func() {
 		// Clean up process reference
@@ -275,15 +328,28 @@ func (s *ImportService) executeImport(taskID int64, dbName, filePath, format str
 		return
 	}
 
+	// Migrate auth users if requested (run on the original file before cleanup)
+	if opts.MigrateAuthUsers {
+		users, extractErr := extractSupabaseAuthUsers(filePath)
+		if extractErr != nil {
+			slog.Warn("Auth user extraction failed (non-fatal)", "task_id", taskID, "error", extractErr)
+		} else if len(users) > 0 {
+			migrated, insertErr := insertMigratedUsers(ctx, dbURL, users)
+			if insertErr != nil {
+				slog.Warn("Auth user migration had errors", "task_id", taskID, "error", insertErr)
+			}
+			slog.Info("Auth users migrated", "task_id", taskID, "migrated", migrated, "total", len(users))
+		}
+	}
+
 	// Mark completed
-	s.db.Exec(ctx, `
+	if _, err := s.db.Exec(ctx, `
 		UPDATE platform.import_tasks
 		SET status = 'completed', tables_imported = $1, completed_at = NOW()
 		WHERE id = $2
-	`, tableCount, taskID)
-
-	// Clean up temp file on success
-	os.Remove(filePath)
+	`, tableCount, taskID); err != nil {
+		slog.Error("failed to mark import as completed", "task_id", taskID, "error", err)
+	}
 
 	slog.Info("Import completed", "task_id", taskID, "db", dbName, "tables", tableCount)
 }
@@ -314,8 +380,17 @@ func (s *ImportService) preImport(ctx context.Context, dbURL string, opts Import
 		return nil
 	}
 
-	sql := strings.Join(stmts, "\n")
-	cmd := exec.CommandContext(ctx, "psql", dbURL, "-c", sql)
+	host, port, user, password, dbName, err := splitDBURL(dbURL)
+	if err != nil {
+		return fmt.Errorf("parse DB URL: %w", err)
+	}
+
+	sqlStr := strings.Join(stmts, "\n")
+	cmd := exec.CommandContext(ctx, "psql",
+		"--host="+host, "--port="+port, "--username="+user, "--dbname="+dbName,
+		"-c", sqlStr,
+	)
+	cmd.Env = append(os.Environ(), "PGPASSWORD="+password)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("pre-import SQL: %s: %w", string(out), err)
@@ -324,8 +399,20 @@ func (s *ImportService) preImport(ctx context.Context, dbURL string, opts Import
 }
 
 func (s *ImportService) postImport(ctx context.Context, dbURL string) {
-	cmd := exec.CommandContext(ctx, "psql", dbURL, "-c", "SET session_replication_role = 'origin';")
-	cmd.CombinedOutput()
+	host, port, user, password, dbName, err := splitDBURL(dbURL)
+	if err != nil {
+		slog.Warn("postImport: failed to parse DB URL", "error", err)
+		return
+	}
+	cmd := exec.CommandContext(ctx, "psql",
+		"--host="+host, "--port="+port, "--username="+user, "--dbname="+dbName,
+		"-c", "SET session_replication_role = 'origin';",
+	)
+	cmd.Env = append(os.Environ(), "PGPASSWORD="+password)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		slog.Warn("postImport command failed", "error", err, "output", string(out))
+	}
 }
 
 // importCustomDump handles pg_restore for custom format dumps.
@@ -338,16 +425,21 @@ func (s *ImportService) importCustomDump(ctx context.Context, taskID int64, dbUR
 		return s.importCustomDumpFiltered(cancelCtx, taskID, dbURL, filePath)
 	}
 
+	host, port, user, password, dbName, err := splitDBURL(dbURL)
+	if err != nil {
+		return 0, fmt.Errorf("parse DB URL: %w", err)
+	}
+
 	// Direct restore (--clean --if-exists drops before creating)
 	cmd := exec.CommandContext(cancelCtx, "pg_restore",
 		"--no-owner",
 		"--no-acl",
-		"--role=stech",
 		"--clean",
 		"--if-exists",
-		"--dbname="+dbURL,
+		"--host="+host, "--port="+port, "--username="+user, "--dbname="+dbName,
 		filePath,
 	)
+	cmd.Env = append(os.Environ(), "PGPASSWORD="+password)
 
 	s.mu.Lock()
 	s.processes[taskID] = cmd
@@ -394,16 +486,21 @@ func (s *ImportService) importCustomDumpFiltered(ctx context.Context, taskID int
 	tocFile.Close()
 
 	// Step 4: Restore with filtered TOC (--clean --if-exists drops before creating)
+	host, port, user, password, dbName, err := splitDBURL(dbURL)
+	if err != nil {
+		return 0, fmt.Errorf("parse DB URL: %w", err)
+	}
+
 	cmd := exec.CommandContext(ctx, "pg_restore",
 		"--no-owner",
 		"--no-acl",
-		"--role=stech",
 		"--clean",
 		"--if-exists",
 		"--use-list="+tocFile.Name(),
-		"--dbname="+dbURL,
+		"--host="+host, "--port="+port, "--username="+user, "--dbname="+dbName,
 		filePath,
 	)
+	cmd.Env = append(os.Environ(), "PGPASSWORD="+password)
 
 	s.mu.Lock()
 	s.processes[taskID] = cmd
@@ -440,10 +537,16 @@ func (s *ImportService) importPlainSQL(ctx context.Context, taskID int64, dbURL,
 		defer os.Remove(filtered)
 	}
 
+	host, port, user, password, dbName, err := splitDBURL(dbURL)
+	if err != nil {
+		return 0, fmt.Errorf("parse DB URL: %w", err)
+	}
+
 	cmd := exec.CommandContext(cancelCtx, "psql",
-		dbURL,
+		"--host="+host, "--port="+port, "--username="+user, "--dbname="+dbName,
 		"-f", importFile,
 	)
+	cmd.Env = append(os.Environ(), "PGPASSWORD="+password)
 
 	s.mu.Lock()
 	s.processes[taskID] = cmd
@@ -456,13 +559,16 @@ func (s *ImportService) importPlainSQL(ctx context.Context, taskID int64, dbURL,
 		// Check if we got at least some tables imported
 		tableCount := countRestoredTables(cancelCtx, dbURL)
 		if tableCount > 0 {
-			slog.Warn("psql import completed with errors", "task_id", taskID, "tables", tableCount)
+			slog.Warn("psql import completed with errors", "task_id", taskID, "tables", tableCount, "stderr", outStr)
 			return tableCount, nil
 		}
 		return 0, fmt.Errorf("psql import: %s", outStr)
 	}
 
 	tableCount := countRestoredTables(cancelCtx, dbURL)
+	if tableCount > 0 && !isOnlyWarnings(outStr) {
+		slog.Warn("import completed with errors", "task_id", taskID, "tables", tableCount, "stderr", outStr)
+	}
 	return tableCount, nil
 }
 
@@ -473,6 +579,23 @@ func (s *ImportService) markImportFailed(ctx context.Context, taskID int64, errM
 		SET status = 'failed', error_message = $1, completed_at = NOW()
 		WHERE id = $2
 	`, errMsg, taskID)
+}
+
+// splitDBURL parses a PostgreSQL connection URL into its components.
+func splitDBURL(dbURL string) (host, port, user, password, dbName string, err error) {
+	u, err := url.Parse(dbURL)
+	if err != nil {
+		return "", "", "", "", "", err
+	}
+	host = u.Hostname()
+	port = u.Port()
+	if port == "" {
+		port = "5432"
+	}
+	user = u.User.Username()
+	password, _ = u.User.Password()
+	dbName = strings.TrimPrefix(u.Path, "/")
+	return
 }
 
 // --- Helpers ---
@@ -655,7 +778,9 @@ func filterSQLFile(inputPath string) (string, error) {
 	return output.Name(), nil
 }
 
-// isOnlyWarnings checks if pg_restore output contains only non-fatal warnings.
+// isOnlyWarnings checks if pg_restore/psql output contains only warnings.
+// Returns true if no error-level lines are found.
+// NOTE: Detects both PostgreSQL ERROR/FATAL/PANIC lines and pg_restore: error: lines.
 func isOnlyWarnings(output string) bool {
 	lines := strings.Split(output, "\n")
 	for _, line := range lines {
@@ -670,8 +795,14 @@ func isOnlyWarnings(output string) bool {
 			strings.HasPrefix(line, "HINT:") {
 			continue
 		}
-		// Error lines
-		if strings.Contains(line, "ERROR") || strings.Contains(line, "FATAL") {
+		// Specific error patterns from pg_restore/pg_dump/psql and PostgreSQL
+		if strings.Contains(line, "pg_restore: error:") || strings.Contains(line, "pg_dump: error:") ||
+			strings.HasPrefix(line, "ERROR:") ||
+			strings.Contains(line, "FATAL:") || strings.Contains(line, "PANIC:") {
+			return false
+		}
+		// pg_restore archiver errors
+		if strings.Contains(line, "pg_restore: [archiver]") {
 			return false
 		}
 	}
@@ -680,8 +811,15 @@ func isOnlyWarnings(output string) bool {
 
 // countRestoredTables counts public tables in the target database.
 func countRestoredTables(ctx context.Context, dbURL string) int {
-	cmd := exec.CommandContext(ctx, "psql", dbURL, "-tAc",
-		"SELECT count(*) FROM pg_tables WHERE schemaname = 'public'")
+	host, port, user, password, dbName, err := splitDBURL(dbURL)
+	if err != nil {
+		return 0
+	}
+	cmd := exec.CommandContext(ctx, "psql",
+		"--host="+host, "--port="+port, "--username="+user, "--dbname="+dbName,
+		"-tAc", "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'",
+	)
+	cmd.Env = append(os.Environ(), "PGPASSWORD="+password)
 	out, err := cmd.Output()
 	if err != nil {
 		return 0
@@ -691,8 +829,344 @@ func countRestoredTables(ctx context.Context, dbURL string) int {
 	return count
 }
 
-// readOutput reads all output from a reader and returns it as a string.
-func readOutput(r io.Reader) string {
-	b, _ := io.ReadAll(r)
-	return string(b)
+// AnalyzeDump inspects a dump file and detects whether it's a Supabase dump.
+// It reads up to the first 10MB of the file looking for Supabase-specific signatures.
+func (s *ImportService) AnalyzeDump(filePath string) (*DumpAnalysis, int, error) {
+	format := detectFormat(filePath)
+
+	analysis := &DumpAnalysis{
+		Format:          format,
+		SupabaseSchemas: []string{},
+		DetectedSignals: []string{},
+	}
+
+	if format == "custom" {
+		// For custom format, use pg_restore --list to get TOC and analyze it
+		cmd := exec.Command("pg_restore", "--list", filePath)
+		tocOutput, err := cmd.Output()
+		if err != nil {
+			return nil, http.StatusInternalServerError, fmt.Errorf("pg_restore --list: %w", err)
+		}
+		s.analyzeContent(string(tocOutput), analysis)
+	} else {
+		// For SQL files, read first 10MB
+		f, err := os.Open(filePath)
+		if err != nil {
+			return nil, http.StatusInternalServerError, fmt.Errorf("open file: %w", err)
+		}
+		defer f.Close()
+
+		buf := make([]byte, 10*1024*1024)
+		n, _ := f.Read(buf)
+		content := string(buf[:n])
+		s.analyzeContent(content, analysis)
+	}
+
+	// Set recommendation
+	if analysis.IsSupabaseDump {
+		if analysis.HasAuthUsers {
+			analysis.RecommendedAction = "Import with 'Skip Auth Schema' enabled and optionally 'Migrate Auth Users' to transfer existing users to Dupabase's auth system."
+		} else {
+			analysis.RecommendedAction = "Import with 'Skip Auth Schema' enabled. Supabase-specific schemas will be filtered automatically."
+		}
+	} else {
+		analysis.RecommendedAction = "Standard import. No Supabase-specific handling needed."
+	}
+
+	return analysis, http.StatusOK, nil
+}
+
+// analyzeContent scans content for Supabase signatures and populates the analysis.
+func (s *ImportService) analyzeContent(content string, analysis *DumpAnalysis) {
+	signalCount := 0
+	for _, sig := range supabaseSignatures {
+		if strings.Contains(content, sig.pattern) {
+			analysis.DetectedSignals = append(analysis.DetectedSignals, sig.signal)
+			signalCount++
+		}
+	}
+
+	// Detect Supabase schemas present
+	for _, schema := range supabaseSchemaNames {
+		// Look for schema references (in TOC or SQL)
+		if strings.Contains(content, schema+".") || strings.Contains(content, "SCHEMA "+schema) || strings.Contains(content, schema+" ") {
+			analysis.SupabaseSchemas = append(analysis.SupabaseSchemas, schema)
+		}
+	}
+
+	// Check for auth users data
+	analysis.HasAuthUsers = strings.Contains(content, "auth.users") || strings.Contains(content, "COPY auth.users") || strings.Contains(content, "INSERT INTO auth.users")
+
+	// Check for supabase_migrations
+	analysis.HasMigrations = strings.Contains(content, "supabase_migrations")
+
+	// Consider it a Supabase dump if we found 3+ signals
+	analysis.IsSupabaseDump = signalCount >= 3
+}
+
+// MigrateSupabaseAuthUsers extracts auth users from a Supabase SQL dump
+// and inserts them into the project's auth.users table with column mapping.
+// Only works with plain SQL format dumps containing COPY or INSERT statements.
+func (s *ImportService) MigrateSupabaseAuthUsers(ctx context.Context, projectID, filePath string) (int, int, error) {
+	// Get project pool
+	var dbName string
+	err := s.db.QueryRow(ctx, `
+		SELECT db_name FROM platform.projects WHERE id = $1 AND status = 'active'
+	`, projectID).Scan(&dbName)
+	if err != nil {
+		return 0, http.StatusNotFound, fmt.Errorf("project not found or not active")
+	}
+
+	dbURL, err := s.buildDBURL(dbName)
+	if err != nil {
+		return 0, http.StatusInternalServerError, fmt.Errorf("build DB URL: %w", err)
+	}
+
+	// Read the file and extract auth users
+	users, err := extractSupabaseAuthUsers(filePath)
+	if err != nil {
+		return 0, http.StatusBadRequest, fmt.Errorf("extract auth users: %w", err)
+	}
+
+	if len(users) == 0 {
+		return 0, http.StatusOK, nil
+	}
+
+	// Insert users into the project's auth.users table
+	migrated, err := insertMigratedUsers(ctx, dbURL, users)
+	if err != nil {
+		return migrated, http.StatusInternalServerError, fmt.Errorf("insert users: %w", err)
+	}
+
+	slog.Info("Supabase auth user migration completed", "project_id", projectID, "migrated", migrated, "total", len(users))
+	return migrated, http.StatusOK, nil
+}
+
+// supabaseAuthUser represents a user extracted from a Supabase auth.users dump.
+type supabaseAuthUser struct {
+	id                string
+	email             string
+	encryptedPassword string
+	emailConfirmedAt  string
+	phone             string
+	phoneConfirmedAt  string
+	lastSignInAt      string
+	rawAppMetaData    string
+	rawUserMetaData   string
+	isAnonymous       string
+	bannedUntil       string
+	createdAt         string
+	updatedAt         string
+}
+
+// extractSupabaseAuthUsers parses a SQL dump file for COPY auth.users or INSERT INTO auth.users.
+func extractSupabaseAuthUsers(filePath string) ([]supabaseAuthUser, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("open file: %w", err)
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	buf := make([]byte, 0, 1024*1024)
+	scanner.Buffer(buf, 10*1024*1024)
+
+	var users []supabaseAuthUser
+	inCopy := false
+	var copyColumns []string
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		trimmed := strings.TrimSpace(line)
+
+		if inCopy {
+			if line == "\\." {
+				inCopy = false
+				continue
+			}
+			// Parse tab-separated COPY data
+			user := parseCopyRow(line, copyColumns)
+			if user != nil {
+				users = append(users, *user)
+			}
+			continue
+		}
+
+		// Detect COPY auth.users ... FROM stdin
+		upper := strings.ToUpper(trimmed)
+		if strings.HasPrefix(upper, "COPY AUTH.USERS") && strings.Contains(upper, "FROM STDIN") {
+			copyColumns = parseCopyColumns(trimmed)
+			if len(copyColumns) > 0 {
+				inCopy = true
+			}
+			continue
+		}
+	}
+
+	return users, scanner.Err()
+}
+
+// parseCopyColumns extracts column names from a COPY statement.
+// e.g., "COPY auth.users (id, email, encrypted_password, ...) FROM stdin;"
+func parseCopyColumns(stmt string) []string {
+	start := strings.Index(stmt, "(")
+	end := strings.Index(stmt, ")")
+	if start < 0 || end < 0 || end <= start {
+		return nil
+	}
+
+	colStr := stmt[start+1 : end]
+	parts := strings.Split(colStr, ",")
+	columns := make([]string, 0, len(parts))
+	for _, p := range parts {
+		columns = append(columns, strings.TrimSpace(p))
+	}
+	return columns
+}
+
+// parseCopyRow converts a tab-separated COPY data row into a supabaseAuthUser.
+func parseCopyRow(line string, columns []string) *supabaseAuthUser {
+	fields := strings.Split(line, "\t")
+	if len(fields) < len(columns) {
+		return nil
+	}
+
+	// Build column->value map
+	colMap := make(map[string]string, len(columns))
+	for i, col := range columns {
+		if i < len(fields) {
+			val := fields[i]
+			if val == "\\N" {
+				val = ""
+			}
+			colMap[col] = val
+		}
+	}
+
+	return &supabaseAuthUser{
+		id:                colMap["id"],
+		email:             colMap["email"],
+		encryptedPassword: colMap["encrypted_password"],
+		emailConfirmedAt:  colMap["email_confirmed_at"],
+		phone:             colMap["phone"],
+		phoneConfirmedAt:  colMap["phone_confirmed_at"],
+		lastSignInAt:      colMap["last_sign_in_at"],
+		rawAppMetaData:    colMap["raw_app_meta_data"],
+		rawUserMetaData:   colMap["raw_user_meta_data"],
+		isAnonymous:       colMap["is_anonymous"],
+		bannedUntil:       colMap["banned_until"],
+		createdAt:         colMap["created_at"],
+		updatedAt:         colMap["updated_at"],
+	}
+}
+
+// insertMigratedUsers inserts extracted Supabase auth users into the target database.
+// Existing users (by ID or email) are skipped.
+func insertMigratedUsers(ctx context.Context, dbURL string, users []supabaseAuthUser) (int, error) {
+	host, port, user, password, dbName, err := splitDBURL(dbURL)
+	if err != nil {
+		return 0, fmt.Errorf("parse DB URL: %w", err)
+	}
+
+	// Build a SQL script with INSERT statements
+	var sb strings.Builder
+	sb.WriteString("BEGIN;\n")
+	for _, u := range users {
+		if u.id == "" || u.email == "" {
+			continue
+		}
+
+		// Use INSERT ... ON CONFLICT DO NOTHING to skip existing users
+		sb.WriteString(fmt.Sprintf(
+			`INSERT INTO auth.users (id, email, encrypted_password, email_confirmed_at, phone, phone_confirmed_at, last_sign_in_at, raw_app_meta_data, raw_user_meta_data, is_anonymous, banned_until, created_at, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING;`+"\n",
+			sqlQuote(u.id),
+			sqlQuote(u.email),
+			sqlQuote(u.encryptedPassword),
+			sqlQuoteNullable(u.emailConfirmedAt),
+			sqlQuoteNullable(u.phone),
+			sqlQuoteNullable(u.phoneConfirmedAt),
+			sqlQuoteNullable(u.lastSignInAt),
+			sqlQuoteJSON(u.rawAppMetaData),
+			sqlQuoteJSON(u.rawUserMetaData),
+			sqlQuoteBool(u.isAnonymous),
+			sqlQuoteNullable(u.bannedUntil),
+			sqlQuoteTimestamp(u.createdAt),
+			sqlQuoteTimestamp(u.updatedAt),
+		))
+	}
+	sb.WriteString("COMMIT;\n")
+
+	// Write to temp file and execute via psql
+	tmpFile, err := os.CreateTemp("", "auth-migrate-*.sql")
+	if err != nil {
+		return 0, fmt.Errorf("create temp file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.WriteString(sb.String()); err != nil {
+		tmpFile.Close()
+		return 0, fmt.Errorf("write temp file: %w", err)
+	}
+	tmpFile.Close()
+
+	cmd := exec.CommandContext(ctx, "psql",
+		"--host="+host, "--port="+port, "--username="+user, "--dbname="+dbName,
+		"-f", tmpFile.Name(),
+	)
+	cmd.Env = append(os.Environ(), "PGPASSWORD="+password)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		outStr := string(out)
+		slog.Warn("auth user migration had errors", "output", outStr)
+	}
+
+	// Count how many were actually inserted
+	countCmd := exec.CommandContext(ctx, "psql",
+		"--host="+host, "--port="+port, "--username="+user, "--dbname="+dbName,
+		"-tAc", "SELECT count(*) FROM auth.users",
+	)
+	countCmd.Env = append(os.Environ(), "PGPASSWORD="+password)
+	countOut, err := countCmd.Output()
+	if err != nil {
+		return len(users), nil
+	}
+	var count int
+	fmt.Sscanf(strings.TrimSpace(string(countOut)), "%d", &count)
+	return count, nil
+}
+
+// SQL escaping helpers for migration
+func sqlQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+func sqlQuoteNullable(s string) string {
+	if s == "" {
+		return "NULL"
+	}
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+func sqlQuoteJSON(s string) string {
+	if s == "" || s == "\\N" {
+		return "'{}'::jsonb"
+	}
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'::jsonb"
+}
+
+func sqlQuoteBool(s string) string {
+	if s == "true" || s == "t" {
+		return "true"
+	}
+	return "false"
+}
+
+func sqlQuoteTimestamp(s string) string {
+	if s == "" {
+		return "NOW()"
+	}
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }

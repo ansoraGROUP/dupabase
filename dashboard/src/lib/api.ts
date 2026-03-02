@@ -56,12 +56,12 @@ export const platformAuth = {
 
 // Projects
 export const projects = {
-  list: (token: string) =>
-    api<Project[]>("/platform/projects", { token }),
-  create: (token: string, name: string) =>
+  list: (token: string, orgId?: string) =>
+    api<Project[]>(`/platform/projects${orgId ? `?org_id=${orgId}` : ''}`, { token }),
+  create: (token: string, name: string, orgId?: string) =>
     api<Project>("/platform/projects", {
       method: "POST",
-      body: { name },
+      body: { name, ...(orgId ? { org_id: orgId } : {}) },
       token,
     }),
   delete: (token: string, id: string) =>
@@ -99,6 +99,7 @@ export const imports = {
     if (options.clean_import) formData.append("clean_import", "true");
     formData.append("skip_auth_schema", options.skip_auth_schema === false ? "false" : "true");
     formData.append("disable_triggers", options.disable_triggers === false ? "false" : "true");
+    if (options.migrate_auth_users) formData.append("migrate_auth_users", "true");
     try {
       const res = await fetch(
         `${API_URL}/platform/projects/${projectId}/import`,
@@ -124,6 +125,22 @@ export const imports = {
       method: "POST",
       token,
     }),
+  analyze: async (token: string, projectId: string, file: File) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    try {
+      const res = await fetch(`${API_URL}/platform/projects/${projectId}/import/analyze`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: formData,
+      });
+      const json = await res.json();
+      if (!res.ok) return { data: null, error: json.error || `Error ${res.status}` };
+      return { data: json as DumpAnalysis, error: null };
+    } catch (err) {
+      return { data: null, error: (err as Error).message };
+    }
+  },
 };
 
 // Backups
@@ -182,6 +199,62 @@ export const admin = {
     }),
 };
 
+// Organizations
+export const orgs = {
+  create: (token: string, name: string, slug: string) =>
+    api<Organization>("/platform/orgs", {
+      method: "POST",
+      body: { name, slug },
+      token,
+    }),
+  list: (token: string) =>
+    api<Organization[]>("/platform/orgs", { token }),
+  get: (token: string, id: string) =>
+    api<OrgDetail>(`/platform/orgs/${id}`, { token }),
+  update: (token: string, id: string, data: { name?: string; slug?: string }) =>
+    api<Organization>(`/platform/orgs/${id}`, {
+      method: "PATCH",
+      body: data,
+      token,
+    }),
+  delete: (token: string, id: string) =>
+    api<{ status: string }>(`/platform/orgs/${id}`, {
+      method: "DELETE",
+      token,
+    }),
+  listMembers: (token: string, id: string) =>
+    api<OrgMember[]>(`/platform/orgs/${id}/members`, { token }),
+  createInvite: (token: string, id: string, email: string, role: string) =>
+    api<OrgInvite>(`/platform/orgs/${id}/invites`, {
+      method: "POST",
+      body: { email, role },
+      token,
+    }),
+  acceptInvite: (token: string, inviteToken: string) =>
+    api<Organization>(`/platform/orgs/invites/${inviteToken}/accept`, {
+      method: "POST",
+      token,
+    }),
+  removeMember: (token: string, id: string, userId: string) =>
+    api<{ status: string }>(`/platform/orgs/${id}/members/${userId}`, {
+      method: "DELETE",
+      token,
+    }),
+  updateMemberRole: (token: string, id: string, userId: string, role: string) =>
+    api<{ status: string }>(`/platform/orgs/${id}/members/${userId}`, {
+      method: "PATCH",
+      body: { role },
+      token,
+    }),
+  listInvites: (token: string, id: string) =>
+    api<OrgInvite[]>(`/platform/orgs/${id}/invites`, { token }),
+  revokeInvite: (token: string, id: string, inviteId: string) =>
+    api<{ status: string }>(`/platform/orgs/${id}/invites/${inviteId}`, {
+      method: "DELETE",
+      token,
+    }),
+};
+
 // Types
 export interface SaveBackupSettingsRequest {
   s3_endpoint: string;
@@ -224,6 +297,19 @@ export interface ImportOptions {
   clean_import?: boolean;
   skip_auth_schema?: boolean;
   disable_triggers?: boolean;
+  migrate_auth_users?: boolean;
+}
+
+export interface DumpAnalysis {
+  is_supabase_dump: boolean;
+  format: string;
+  has_auth_users: boolean;
+  has_migrations: boolean;
+  supabase_schemas: string[];
+  detected_signals: string[];
+  recommended_action: string;
+  file_name: string;
+  file_size: number;
 }
 
 export interface ImportTask {
@@ -299,3 +385,248 @@ export interface Project {
   settings: ProjectSettings;
   created_at: string;
 }
+
+// Organization types
+export interface Organization {
+  id: string;
+  name: string;
+  slug: string;
+  created_by: string;
+  role?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface OrgDetail extends Organization {
+  member_count: number;
+}
+
+export interface OrgMember {
+  id: string;
+  org_id: string;
+  user_id: string;
+  email: string;
+  role: 'owner' | 'admin' | 'developer' | 'viewer';
+  created_at: string;
+}
+
+export interface OrgInvite {
+  id: string;
+  org_id: string;
+  email: string;
+  role: 'owner' | 'admin' | 'developer' | 'viewer';
+  invited_by: string;
+  token: string;
+  accepted_at: string | null;
+  expires_at: string;
+  created_at: string;
+}
+
+// Table browser types
+export interface TableInfo {
+  schema: string;
+  name: string;
+  column_count: number;
+}
+
+export interface ColumnInfo {
+  name: string;
+  type: string;
+  nullable: boolean;
+  default: string | null;
+  max_length: number | null;
+  precision: number | null;
+}
+
+export interface TableRowsResponse {
+  columns: string[];
+  rows: any[][];
+  total: number;
+  page: number;
+  per_page: number;
+}
+
+// SQL editor types
+export interface SQLRequest {
+  query: string;
+  read_only?: boolean;
+}
+
+export interface SQLResponse {
+  columns: string[];
+  rows: any[][];
+  row_count: number;
+  execution_time_ms: number;
+}
+
+// Auth user types
+export interface AuthUserInfo {
+  id: string;
+  email: string | null;
+  phone: string | null;
+  email_confirmed_at: string | null;
+  phone_confirmed_at: string | null;
+  last_sign_in_at: string | null;
+  is_anonymous: boolean;
+  banned_until: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AuthUserDetail extends AuthUserInfo {
+  app_metadata: any;
+  user_metadata: any;
+  sessions: AuthSessionInfo[];
+}
+
+export interface AuthSessionInfo {
+  id: string;
+  created_at: string;
+  updated_at: string;
+  user_agent: string | null;
+  ip: string | null;
+}
+
+export interface AuthUserListResponse {
+  users: AuthUserInfo[];
+  total: number;
+  page: number;
+  per_page: number;
+}
+
+// Log types
+export interface LogEntry {
+  id: number;
+  user_id: string | null;
+  action: string;
+  resource_type: string | null;
+  resource_id: string | null;
+  ip_address: string | null;
+  user_agent: string | null;
+  metadata: any;
+  created_at: string;
+}
+
+// Analytics types
+export interface TableStats {
+  schema: string;
+  name: string;
+  row_count: number;
+  total_size: number;
+  index_size: number;
+}
+
+export interface DatabaseAnalytics {
+  db_size: number;
+  table_count: number;
+  total_rows: number;
+  tables: TableStats[];
+}
+
+export interface ConnectionState {
+  state: string;
+  count: number;
+}
+
+export interface ConnectionAnalytics {
+  total: number;
+  active: number;
+  idle: number;
+  idle_in_transaction: number;
+  connections: ConnectionState[];
+}
+
+export interface QueryStats {
+  query: string;
+  calls: number;
+  total_time_ms: number;
+  mean_time_ms: number;
+  rows: number;
+}
+
+export interface QueryAnalytics {
+  available: boolean;
+  queries: QueryStats[];
+}
+
+export interface AuthAnalytics {
+  total_users: number;
+  signups_7d: number;
+  signups_30d: number;
+  active_sessions: number;
+}
+
+export interface DailyUsage {
+  day: string;
+  action: string;
+  count: number;
+}
+
+export interface APIUsageAnalytics {
+  daily_usage: DailyUsage[];
+}
+
+export interface OverviewAnalytics {
+  database: DatabaseAnalytics | null;
+  connections: ConnectionAnalytics | null;
+  auth: AuthAnalytics | null;
+  api_usage: APIUsageAnalytics | null;
+}
+
+// Tables
+export const tables = {
+  list: (token: string, projectId: string) =>
+    api<TableInfo[]>(`/platform/projects/${projectId}/tables`, { token }),
+  columns: (token: string, projectId: string, table: string, schema = "public") =>
+    api<ColumnInfo[]>(`/platform/projects/${projectId}/tables/${table}/columns?schema=${schema}`, { token }),
+  rows: (token: string, projectId: string, table: string, params: { schema?: string; page?: number; perPage?: number; orderBy?: string; orderDir?: string }) =>
+    api<TableRowsResponse>(`/platform/projects/${projectId}/tables/${table}/rows?schema=${params.schema || "public"}&page=${params.page || 1}&per_page=${params.perPage || 50}&order_by=${params.orderBy || ""}&order_dir=${params.orderDir || ""}`, { token }),
+  insertRow: (token: string, projectId: string, table: string, data: Record<string, unknown>, schema = "public") =>
+    api<any>(`/platform/projects/${projectId}/tables/${table}/rows?schema=${schema}`, { method: "POST", token, body: data }),
+  updateRow: (token: string, projectId: string, table: string, pkColumn: string, pkValue: string, data: Record<string, unknown>, schema = "public") =>
+    api<any>(`/platform/projects/${projectId}/tables/${table}/rows?schema=${schema}&pk_column=${pkColumn}&pk_value=${pkValue}`, { method: "PATCH", token, body: data }),
+  deleteRow: (token: string, projectId: string, table: string, pkColumn: string, pkValue: string, schema = "public") =>
+    api<any>(`/platform/projects/${projectId}/tables/${table}/rows?schema=${schema}&pk_column=${pkColumn}&pk_value=${pkValue}`, { method: "DELETE", token }),
+};
+
+// SQL
+export const sql = {
+  execute: (token: string, projectId: string, query: string, readOnly = false) =>
+    api<SQLResponse>(`/platform/projects/${projectId}/sql`, { method: "POST", token, body: { query, read_only: readOnly } }),
+};
+
+// Auth Users
+export const authUsers = {
+  list: (token: string, projectId: string, params?: { page?: number; perPage?: number; search?: string }) =>
+    api<AuthUserListResponse>(`/platform/projects/${projectId}/auth/users?page=${params?.page || 1}&per_page=${params?.perPage || 50}&search=${params?.search || ""}`, { token }),
+  get: (token: string, projectId: string, userId: string) =>
+    api<AuthUserDetail>(`/platform/projects/${projectId}/auth/users/${userId}`, { token }),
+  delete: (token: string, projectId: string, userId: string) =>
+    api<any>(`/platform/projects/${projectId}/auth/users/${userId}`, { method: "DELETE", token }),
+  ban: (token: string, projectId: string, userId: string) =>
+    api<any>(`/platform/projects/${projectId}/auth/users/${userId}/ban`, { method: "POST", token }),
+  unban: (token: string, projectId: string, userId: string) =>
+    api<any>(`/platform/projects/${projectId}/auth/users/${userId}/unban`, { method: "POST", token }),
+};
+
+// Logs
+export const logs = {
+  list: (token: string, projectId: string, params?: { page?: number; action?: string; from?: string; to?: string }) =>
+    api<{ logs: LogEntry[]; page: number }>(`/platform/projects/${projectId}/logs?page=${params?.page || 1}&action=${params?.action || ""}&from=${params?.from || ""}&to=${params?.to || ""}`, { token }),
+};
+
+// Analytics
+export const analytics = {
+  overview: (token: string, projectId: string) =>
+    api<OverviewAnalytics>(`/platform/projects/${projectId}/analytics/overview`, { token }),
+  database: (token: string, projectId: string) =>
+    api<DatabaseAnalytics>(`/platform/projects/${projectId}/analytics/database`, { token }),
+  connections: (token: string, projectId: string) =>
+    api<ConnectionAnalytics>(`/platform/projects/${projectId}/analytics/connections`, { token }),
+  queries: (token: string, projectId: string) =>
+    api<QueryAnalytics>(`/platform/projects/${projectId}/analytics/queries`, { token }),
+  auth: (token: string, projectId: string) =>
+    api<AuthAnalytics>(`/platform/projects/${projectId}/analytics/auth`, { token }),
+  apiUsage: (token: string, projectId: string) =>
+    api<APIUsageAnalytics>(`/platform/projects/${projectId}/analytics/api-usage`, { token }),
+};

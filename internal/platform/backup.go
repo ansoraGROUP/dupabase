@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
 	"time"
 
@@ -43,9 +45,9 @@ type SaveBackupSettingsRequest struct {
 	S3AccessKey      string   `json:"s3_access_key"`
 	S3SecretKey      string   `json:"s3_secret_key"`
 	S3PathPrefix     string   `json:"s3_path_prefix,omitempty"`
-	Schedule         string   `json:"schedule,omitempty"`         // "daily", "weekly", "hourly"
+	Schedule         string   `json:"schedule,omitempty"` // "daily", "weekly", "hourly"
 	RetentionDays    int      `json:"retention_days,omitempty"`
-	ProjectIDs       []string `json:"project_ids,omitempty"`      // empty = all projects
+	ProjectIDs       []string `json:"project_ids,omitempty"` // empty = all projects
 	PlatformPassword string   `json:"platform_password"`
 }
 
@@ -77,18 +79,18 @@ type BackupHistoryResponse struct {
 
 // backupSettingsInternal holds the full row including encrypted credentials.
 type backupSettingsInternal struct {
-	ID                    string
-	UserID                string
-	S3Endpoint            string
-	S3Region              string
-	S3Bucket              string
-	S3AccessKeyEncrypted  string
-	S3SecretKeyEncrypted  string
-	S3PathPrefix          string
-	Schedule              string
-	RetentionDays         int
-	ProjectIDs            []string
-	Enabled               bool
+	ID                   string
+	UserID               string
+	S3Endpoint           string
+	S3Region             string
+	S3Bucket             string
+	S3AccessKeyEncrypted string
+	S3SecretKeyEncrypted string
+	S3PathPrefix         string
+	Schedule             string
+	RetentionDays        int
+	ProjectIDs           []string
+	Enabled              bool
 }
 
 // --- Public methods ---
@@ -303,17 +305,16 @@ func (s *BackupService) RunBackupsForAllUsers(ctx context.Context) error {
 
 	now := time.Now().UTC()
 	for _, settings := range allSettings {
-		if !s.isDue(settings.Schedule, settings.UserID, now) {
-			continue
-		}
-
 		projects, err := s.getActiveProjects(ctx, settings.UserID, settings.ProjectIDs)
 		if err != nil {
-			fmt.Printf("Backup: failed to get projects for user %s: %v\n", settings.UserID, err)
+			slog.Error("Backup: failed to get projects", "user_id", settings.UserID, "error", err)
 			continue
 		}
 
 		for _, proj := range projects {
+			if !s.isDue(ctx, settings.Schedule, proj.id, now) {
+				continue
+			}
 			s.runSingleBackup(ctx, settings.UserID, proj.id, proj.dbName, &settings)
 		}
 	}
@@ -378,15 +379,15 @@ func (s *BackupService) getActiveProjects(ctx context.Context, userID string, fi
 	return projects, nil
 }
 
-// isDue checks whether a backup should run based on the schedule.
-// It looks at the most recent completed backup to decide.
-func (s *BackupService) isDue(schedule, userID string, now time.Time) bool {
+// isDue checks whether a backup should run for a specific project based on the schedule.
+// It looks at the most recent completed backup for that project to decide.
+func (s *BackupService) isDue(ctx context.Context, schedule, projectID string, now time.Time) bool {
 	var lastCompleted time.Time
-	err := s.db.QueryRow(context.Background(), `
+	err := s.db.QueryRow(ctx, `
 		SELECT COALESCE(MAX(completed_at), '1970-01-01'::timestamptz)
 		FROM platform.backup_history
-		WHERE user_id = $1 AND status = 'completed'
-	`, userID).Scan(&lastCompleted)
+		WHERE project_id = $1 AND status = 'completed'
+	`, projectID).Scan(&lastCompleted)
 	if err != nil {
 		return true // if we can't tell, run anyway
 	}
@@ -406,11 +407,15 @@ func (s *BackupService) isDue(schedule, userID string, now time.Time) bool {
 // runSingleBackup performs pg_dump and uploads the result to S3 for one project.
 func (s *BackupService) runSingleBackup(ctx context.Context, userID, projectID, dbName string, settings *backupSettingsInternal) {
 	now := time.Now().UTC()
+	shortID := projectID
+	if len(shortID) > 8 {
+		shortID = shortID[:8]
+	}
 	s3Key := fmt.Sprintf("%s%s/%s_%s.dump",
 		settings.S3PathPrefix,
 		dbName,
 		now.Format("2006-01-02T15-04-05Z"),
-		projectID[:8],
+		shortID,
 	)
 
 	// Insert running record
@@ -421,13 +426,17 @@ func (s *BackupService) runSingleBackup(ctx context.Context, userID, projectID, 
 		RETURNING id
 	`, userID, projectID, dbName, s3Key).Scan(&historyID)
 	if err != nil {
-		fmt.Printf("Backup: failed to insert history for %s: %v\n", dbName, err)
+		slog.Error("Backup: failed to insert history", "db_name", dbName, "error", err)
 		return
 	}
 
 	// Run pg_dump
 	reader, err := s.dumpDatabase(ctx, dbName)
 	if err != nil {
+		if ctx.Err() != nil {
+			s.markBackupCancelled(ctx, historyID)
+			return
+		}
 		s.markBackupFailed(ctx, historyID, fmt.Sprintf("pg_dump failed: %v", err))
 		return
 	}
@@ -436,27 +445,67 @@ func (s *BackupService) runSingleBackup(ctx context.Context, userID, projectID, 
 	// Upload to S3
 	sizeBytes, err := s.uploadToS3(ctx, settings, s3Key, reader)
 	if err != nil {
+		if ctx.Err() != nil {
+			// Try to clean up partial upload with a fresh context
+			s.deleteS3Object(context.Background(), settings, s3Key)
+			s.markBackupCancelled(context.Background(), historyID)
+			return
+		}
 		s.markBackupFailed(ctx, historyID, fmt.Sprintf("S3 upload failed: %v", err))
 		return
 	}
 
 	// Mark completed
-	s.db.Exec(ctx, `
+	if _, err := s.db.Exec(ctx, `
 		UPDATE platform.backup_history
 		SET status = 'completed', size_bytes = $1, completed_at = NOW()
 		WHERE id = $2
-	`, sizeBytes, historyID)
+	`, sizeBytes, historyID); err != nil {
+		slog.Error("failed to update backup history", "error", err)
+	}
 
-	fmt.Printf("Backup: completed %s -> %s (%d bytes)\n", dbName, s3Key, sizeBytes)
+	slog.Info("Backup completed", "db_name", dbName, "s3_key", s3Key, "size_bytes", sizeBytes)
+
+	// Enforce retention policy
+	prefix := settings.S3PathPrefix + dbName + "/"
+	s.enforceRetention(ctx, settings, prefix)
 }
 
 func (s *BackupService) markBackupFailed(ctx context.Context, historyID int64, errMsg string) {
-	fmt.Printf("Backup: failed (history=%d): %s\n", historyID, errMsg)
-	s.db.Exec(ctx, `
+	slog.Error("Backup failed", "history_id", historyID, "error", errMsg)
+	if _, err := s.db.Exec(ctx, `
 		UPDATE platform.backup_history
 		SET status = 'failed', error_message = $1, completed_at = NOW()
 		WHERE id = $2
-	`, errMsg, historyID)
+	`, errMsg, historyID); err != nil {
+		slog.Error("failed to update backup history", "error", err)
+	}
+}
+
+func (s *BackupService) markBackupCancelled(ctx context.Context, historyID int64) {
+	slog.Info("Backup cancelled", "history_id", historyID)
+	if _, err := s.db.Exec(ctx, `
+		UPDATE platform.backup_history
+		SET status = 'cancelled', completed_at = NOW()
+		WHERE id = $1
+	`, historyID); err != nil {
+		slog.Error("failed to update backup history", "error", err)
+	}
+}
+
+// deleteS3Object attempts to remove a partial S3 upload after cancellation.
+func (s *BackupService) deleteS3Object(ctx context.Context, settings *backupSettingsInternal, key string) {
+	client, err := s.getS3Client(ctx, settings)
+	if err != nil {
+		slog.Error("failed to create S3 client for cleanup", "error", err)
+		return
+	}
+	if _, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(settings.S3Bucket),
+		Key:    aws.String(key),
+	}); err != nil {
+		slog.Error("failed to delete partial S3 backup", "key", key, "error", err)
+	}
 }
 
 // dumpDatabase runs pg_dump for a specific database and returns a reader of the output.
@@ -467,12 +516,21 @@ func (s *BackupService) dumpDatabase(ctx context.Context, dbName string) (io.Rea
 	}
 	u.Path = "/" + dbName
 
+	host := u.Hostname()
+	port := u.Port()
+	if port == "" {
+		port = "5432"
+	}
+	user := u.User.Username()
+	password, _ := u.User.Password()
+
 	cmd := exec.CommandContext(ctx, "pg_dump",
 		"--format=custom",
 		"--no-owner",
 		"--no-acl",
-		"--dbname="+u.String(),
+		"--host="+host, "--port="+port, "--username="+user, "--dbname="+dbName,
 	)
+	cmd.Env = append(os.Environ(), "PGPASSWORD="+password)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -502,29 +560,10 @@ func (r *dumpReader) Close() error {
 
 // uploadToS3 decrypts S3 credentials and uploads the dump to S3.
 func (s *BackupService) uploadToS3(ctx context.Context, settings *backupSettingsInternal, key string, body io.Reader) (int64, error) {
-	accessKey, err := DecryptPgPassword(settings.S3AccessKeyEncrypted, s.backupKey)
+	client, err := s.getS3Client(ctx, settings)
 	if err != nil {
-		return 0, fmt.Errorf("decrypt access key: %w", err)
+		return 0, fmt.Errorf("create S3 client: %w", err)
 	}
-	secretKey, err := DecryptPgPassword(settings.S3SecretKeyEncrypted, s.backupKey)
-	if err != nil {
-		return 0, fmt.Errorf("decrypt secret key: %w", err)
-	}
-
-	cfg, err := awsconfig.LoadDefaultConfig(ctx,
-		awsconfig.WithRegion(settings.S3Region),
-		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")),
-	)
-	if err != nil {
-		return 0, fmt.Errorf("load AWS config: %w", err)
-	}
-
-	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		if settings.S3Endpoint != "" {
-			o.BaseEndpoint = aws.String(settings.S3Endpoint)
-			o.UsePathStyle = true // For MinIO/custom S3-compatible endpoints
-		}
-	})
 
 	// We need to buffer to know the size; use a countingReader to track bytes.
 	cr := &countingReader{r: body}
@@ -550,4 +589,81 @@ func (cr *countingReader) Read(p []byte) (int, error) {
 	n, err := cr.r.Read(p)
 	cr.n += int64(n)
 	return n, err
+}
+
+// getS3Client creates an S3 client from backup settings.
+func (s *BackupService) getS3Client(ctx context.Context, settings *backupSettingsInternal) (*s3.Client, error) {
+	accessKey, err := DecryptPgPassword(settings.S3AccessKeyEncrypted, s.backupKey)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt access key: %w", err)
+	}
+	secretKey, err := DecryptPgPassword(settings.S3SecretKeyEncrypted, s.backupKey)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt secret key: %w", err)
+	}
+
+	cfg, err := awsconfig.LoadDefaultConfig(ctx,
+		awsconfig.WithRegion(settings.S3Region),
+		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("load AWS config: %w", err)
+	}
+
+	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		if settings.S3Endpoint != "" {
+			o.BaseEndpoint = aws.String(settings.S3Endpoint)
+			o.UsePathStyle = true
+		}
+	})
+	return client, nil
+}
+
+// enforceRetention deletes backups older than the retention period from S3.
+func (s *BackupService) enforceRetention(ctx context.Context, settings *backupSettingsInternal, prefix string) {
+	if settings.RetentionDays <= 0 {
+		return
+	}
+
+	client, err := s.getS3Client(ctx, settings)
+	if err != nil {
+		slog.Warn("failed to create S3 client for retention cleanup", "error", err)
+		return
+	}
+
+	cutoff := time.Now().AddDate(0, 0, -settings.RetentionDays)
+
+	var continuationToken *string
+	for {
+		input := &s3.ListObjectsV2Input{
+			Bucket:            &settings.S3Bucket,
+			Prefix:            &prefix,
+			ContinuationToken: continuationToken,
+		}
+
+		output, err := client.ListObjectsV2(ctx, input)
+		if err != nil {
+			slog.Warn("failed to list S3 objects for retention", "error", err)
+			return
+		}
+
+		for _, obj := range output.Contents {
+			if obj.LastModified != nil && obj.LastModified.Before(cutoff) {
+				_, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{
+					Bucket: &settings.S3Bucket,
+					Key:    obj.Key,
+				})
+				if err != nil {
+					slog.Warn("failed to delete old backup", "key", *obj.Key, "error", err)
+				} else {
+					slog.Info("deleted old backup", "key", *obj.Key, "age_days", int(time.Since(*obj.LastModified).Hours()/24))
+				}
+			}
+		}
+
+		if output.IsTruncated == nil || !*output.IsTruncated {
+			break
+		}
+		continuationToken = output.NextContinuationToken
+	}
 }

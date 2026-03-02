@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"regexp"
 
 	"github.com/jackc/pgx/v5"
@@ -65,7 +66,10 @@ func ExecuteWithRLS[T any](
 	}
 
 	// Set full claims JSON using parameterized set_config() — safe from injection
-	claimsJSON, _ := json.Marshal(claims)
+	claimsJSON, err := json.Marshal(claims)
+	if err != nil {
+		return zero, fmt.Errorf("marshal JWT claims: %w", err)
+	}
 	_, err = tx.Exec(ctx, `SELECT set_config('request.jwt.claims', $1, true)`, string(claimsJSON))
 	if err != nil {
 		return zero, fmt.Errorf("set jwt claims: %w", err)
@@ -73,13 +77,19 @@ func ExecuteWithRLS[T any](
 
 	// Set individual claims for convenience using parameterized set_config()
 	if sub, ok := claims["sub"].(string); ok && sub != "" {
-		_, _ = tx.Exec(ctx, `SELECT set_config('request.jwt.claim.sub', $1, true)`, sub)
+		if _, err := tx.Exec(ctx, `SELECT set_config('request.jwt.claim.sub', $1, true)`, sub); err != nil {
+			slog.Warn("failed to set JWT claim", "claim", "sub", "error", err)
+		}
 	}
 	if r, ok := claims["role"].(string); ok && r != "" {
-		_, _ = tx.Exec(ctx, `SELECT set_config('request.jwt.claim.role', $1, true)`, r)
+		if _, err := tx.Exec(ctx, `SELECT set_config('request.jwt.claim.role', $1, true)`, r); err != nil {
+			slog.Warn("failed to set JWT claim", "claim", "role", "error", err)
+		}
 	}
 	if email, ok := claims["email"].(string); ok && email != "" {
-		_, _ = tx.Exec(ctx, `SELECT set_config('request.jwt.claim.email', $1, true)`, email)
+		if _, err := tx.Exec(ctx, `SELECT set_config('request.jwt.claim.email', $1, true)`, email); err != nil {
+			slog.Warn("failed to set JWT claim", "claim", "email", "error", err)
+		}
 	}
 
 	result, err := fn(tx)

@@ -3,6 +3,8 @@
 import { useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/lib/auth-context";
+import { OrgProvider, useOrg } from "@/lib/org-context";
+import OrgSwitcher from "@/components/dashboard/org-switcher";
 import {
   SidebarProvider,
   Sidebar,
@@ -45,6 +47,8 @@ import {
   LogOut,
   ChevronUp,
   ShieldCheck,
+  Users,
+  Building2,
 } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
@@ -54,9 +58,8 @@ export default function DashboardLayout({
 }: {
   children: React.ReactNode;
 }) {
-  const { user, loading, logout } = useAuth();
+  const { user, loading } = useAuth();
   const router = useRouter();
-  const pathname = usePathname();
 
   useEffect(() => {
     if (!loading && !user) {
@@ -71,6 +74,21 @@ export default function DashboardLayout({
       </div>
     );
   }
+
+  return (
+    <OrgProvider>
+      <DashboardLayoutInner>{children}</DashboardLayoutInner>
+    </OrgProvider>
+  );
+}
+
+function DashboardLayoutInner({ children }: { children: React.ReactNode }) {
+  const { user, logout } = useAuth();
+  const { activeOrg } = useOrg();
+  const router = useRouter();
+  const pathname = usePathname();
+
+  if (!user) return null;
 
   const initials = user.email
     .split("@")[0]
@@ -113,6 +131,21 @@ export default function DashboardLayout({
       ]
     : [];
 
+  const orgNav = activeOrg
+    ? [
+        {
+          title: "Members",
+          href: `/dashboard/orgs/${activeOrg.id}/members`,
+          icon: Users,
+        },
+        {
+          title: "Org Settings",
+          href: `/dashboard/orgs/${activeOrg.id}/settings`,
+          icon: Building2,
+        },
+      ]
+    : [];
+
   // Build breadcrumb items from pathname
   const getBreadcrumbs = () => {
     const segments = pathname.split("/").filter(Boolean); // ["dashboard", ...]
@@ -139,6 +172,15 @@ export default function DashboardLayout({
       } else {
         crumbs.push({ label: "Project" });
       }
+    } else if (segments[1] === "orgs" && segments[2]) {
+      crumbs.push({ label: activeOrg?.name ?? "Organization", href: "/dashboard" });
+      if (segments[3] === "members") {
+        crumbs.push({ label: "Members" });
+      } else if (segments[3] === "settings") {
+        crumbs.push({ label: "Settings" });
+      }
+    } else if (segments[1] === "invites") {
+      crumbs.push({ label: "Accept Invite" });
     } else {
       crumbs.push({ label: "Dashboard" });
     }
@@ -171,6 +213,8 @@ export default function DashboardLayout({
           </SidebarMenu>
         </SidebarHeader>
 
+        <OrgSwitcher />
+
         <SidebarContent>
           <SidebarGroup>
             <SidebarGroupLabel>Platform</SidebarGroupLabel>
@@ -193,6 +237,30 @@ export default function DashboardLayout({
               </SidebarMenu>
             </SidebarGroupContent>
           </SidebarGroup>
+
+          {orgNav.length > 0 && (
+            <SidebarGroup>
+              <SidebarGroupLabel>Organization</SidebarGroupLabel>
+              <SidebarGroupContent>
+                <SidebarMenu>
+                  {orgNav.map((item) => (
+                    <SidebarMenuItem key={item.href}>
+                      <SidebarMenuButton
+                        asChild
+                        isActive={pathname === item.href || pathname.startsWith(item.href + "/")}
+                        className="data-[active=true]:bg-emerald-500/10 data-[active=true]:text-emerald-400"
+                      >
+                        <Link href={item.href}>
+                          <item.icon className="h-4 w-4" />
+                          <span>{item.title}</span>
+                        </Link>
+                      </SidebarMenuButton>
+                    </SidebarMenuItem>
+                  ))}
+                </SidebarMenu>
+              </SidebarGroupContent>
+            </SidebarGroup>
+          )}
 
           <SidebarGroup>
             <SidebarGroupLabel>Account</SidebarGroupLabel>

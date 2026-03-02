@@ -5,18 +5,27 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"net/mail"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type AdminService struct {
-	db *pgxpool.Pool
+// PoolCloser is an interface for closing project connection pools.
+type PoolCloser interface {
+	ClosePool(projectID string)
 }
 
-func NewAdminService(db *pgxpool.Pool) *AdminService {
-	return &AdminService{db: db}
+type AdminService struct {
+	db          *pgxpool.Pool
+	poolManager PoolCloser
+}
+
+func NewAdminService(db *pgxpool.Pool, poolManager PoolCloser) *AdminService {
+	return &AdminService{db: db, poolManager: poolManager}
 }
 
 // AdminUser is the admin-facing view of a user.
@@ -32,10 +41,10 @@ type AdminUser struct {
 
 // PaginatedUsers holds a page of users plus total count.
 type PaginatedUsers struct {
-	Users []AdminUser `json:"users"`
-	Total int         `json:"total"`
-	Page  int         `json:"page"`
-	PerPage int       `json:"per_page"`
+	Users   []AdminUser `json:"users"`
+	Total   int         `json:"total"`
+	Page    int         `json:"page"`
+	PerPage int         `json:"per_page"`
 }
 
 // ListUsers returns a paginated list of platform users with their project counts.
@@ -96,6 +105,37 @@ func (s *AdminService) DeleteUser(ctx context.Context, callerID, targetID string
 		return http.StatusForbidden, fmt.Errorf("cannot delete an admin user")
 	}
 
+	// Clean up project databases before deleting the user
+	rows, err := s.db.Query(ctx, `SELECT id, db_name FROM platform.projects WHERE user_id = $1`, targetID)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var projectID, dbName string
+			if err := rows.Scan(&projectID, &dbName); err == nil && dbName != "" {
+				if _, err := s.db.Exec(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS %s`, adminQuoteIdent(dbName))); err != nil {
+					slog.Warn("failed to drop project database", "db", dbName, "error", err)
+				} else {
+					slog.Info("dropped project database during user deletion", "db", dbName, "user_id", targetID)
+				}
+				// Close the connection pool for this project
+				if s.poolManager != nil {
+					s.poolManager.ClosePool(projectID)
+				}
+			}
+		}
+	}
+
+	// Clean up PG role
+	var pgUsername string
+	_ = s.db.QueryRow(ctx, `SELECT pg_username FROM platform.pg_users WHERE user_id = $1`, targetID).Scan(&pgUsername)
+	if pgUsername != "" {
+		if _, err := s.db.Exec(ctx, fmt.Sprintf(`DROP ROLE IF EXISTS %s`, adminQuoteIdent(pgUsername))); err != nil {
+			slog.Warn("failed to drop PG role", "role", pgUsername, "error", err)
+		} else {
+			slog.Info("dropped PG role during user deletion", "role", pgUsername, "user_id", targetID)
+		}
+	}
+
 	// Delete user (CASCADE will clean up pg_users, projects, etc.)
 	_, err = s.db.Exec(ctx, `DELETE FROM platform.users WHERE id = $1`, targetID)
 	if err != nil {
@@ -138,14 +178,14 @@ func (s *AdminService) UpdateSettings(ctx context.Context, settings PlatformSett
 
 // Invite represents an invitation code.
 type Invite struct {
-	ID        string    `json:"id"`
-	Code      string    `json:"code"`
-	Email     *string   `json:"email"`
-	CreatedBy string    `json:"created_by"`
-	UsedBy    *string   `json:"used_by"`
+	ID        string     `json:"id"`
+	Code      string     `json:"code"`
+	Email     *string    `json:"email"`
+	CreatedBy string     `json:"created_by"`
+	UsedBy    *string    `json:"used_by"`
 	UsedAt    *time.Time `json:"used_at"`
-	ExpiresAt time.Time `json:"expires_at"`
-	CreatedAt time.Time `json:"created_at"`
+	ExpiresAt time.Time  `json:"expires_at"`
+	CreatedAt time.Time  `json:"created_at"`
 }
 
 type CreateInviteRequest struct {
@@ -155,6 +195,13 @@ type CreateInviteRequest struct {
 
 // CreateInvite generates a new invite code.
 func (s *AdminService) CreateInvite(ctx context.Context, createdBy string, req CreateInviteRequest) (*Invite, int, error) {
+	// Validate email if provided
+	if req.Email != "" {
+		if _, err := mail.ParseAddress(req.Email); err != nil {
+			return nil, http.StatusBadRequest, fmt.Errorf("invalid email format")
+		}
+	}
+
 	// Generate 16-byte hex code
 	codeBytes := make([]byte, 16)
 	if _, err := rand.Read(codeBytes); err != nil {
@@ -225,4 +272,9 @@ func (s *AdminService) DeleteInvite(ctx context.Context, inviteID string) (int, 
 		return http.StatusNotFound, fmt.Errorf("invite not found")
 	}
 	return http.StatusOK, nil
+}
+
+// adminQuoteIdent quotes a SQL identifier to prevent injection.
+func adminQuoteIdent(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }

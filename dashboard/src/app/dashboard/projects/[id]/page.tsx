@@ -16,7 +16,7 @@ import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { toast } from "sonner";
-import { ArrowLeft, Database, Globe, Key, Settings, Upload } from "lucide-react";
+import { ArrowLeft, BarChart3, Database, Globe, Key, Settings, Upload, TableProperties, Terminal, Users, ScrollText } from "lucide-react";
 import Link from "next/link";
 import { SecretField } from "@/components/dashboard/secret-field";
 import { CopyButton } from "@/components/dashboard/copy-button";
@@ -147,12 +147,44 @@ const { data: todos } = await supabase
             {project.db_name}
           </p>
         </div>
-        <Button variant="outline" size="sm" className="shrink-0" asChild>
-          <Link href={`/dashboard/projects/${id}/settings`}>
-            <Settings className="mr-1.5 h-3.5 w-3.5" />
-            Settings
-          </Link>
-        </Button>
+        <div className="flex items-center gap-2 shrink-0 flex-wrap">
+          <Button variant="outline" size="sm" asChild>
+            <Link href={`/dashboard/projects/${id}/tables`}>
+              <TableProperties className="mr-1.5 h-3.5 w-3.5" />
+              Tables
+            </Link>
+          </Button>
+          <Button variant="outline" size="sm" asChild>
+            <Link href={`/dashboard/projects/${id}/sql`}>
+              <Terminal className="mr-1.5 h-3.5 w-3.5" />
+              SQL
+            </Link>
+          </Button>
+          <Button variant="outline" size="sm" asChild>
+            <Link href={`/dashboard/projects/${id}/auth`}>
+              <Users className="mr-1.5 h-3.5 w-3.5" />
+              Auth Users
+            </Link>
+          </Button>
+          <Button variant="outline" size="sm" asChild>
+            <Link href={`/dashboard/projects/${id}/logs`}>
+              <ScrollText className="mr-1.5 h-3.5 w-3.5" />
+              Logs
+            </Link>
+          </Button>
+          <Button variant="outline" size="sm" asChild>
+            <Link href={`/dashboard/projects/${id}/analytics`}>
+              <BarChart3 className="mr-1.5 h-3.5 w-3.5" />
+              Analytics
+            </Link>
+          </Button>
+          <Button variant="outline" size="sm" asChild>
+            <Link href={`/dashboard/projects/${id}/settings`}>
+              <Settings className="mr-1.5 h-3.5 w-3.5" />
+              Settings
+            </Link>
+          </Button>
+        </div>
       </div>
 
       <Tabs defaultValue="api-keys">

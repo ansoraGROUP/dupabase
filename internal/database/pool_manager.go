@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ansoraGROUP/dupabase/internal/config"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type poolEntry struct {
@@ -220,6 +220,7 @@ func (pm *PoolManager) evictIdle() {
 		if time.Since(entry.lastUsed) > timeout {
 			entry.pool.Close()
 			delete(pm.pools, id)
+			delete(pm.projectCache, id)
 		}
 	}
 }
@@ -238,5 +239,6 @@ func (pm *PoolManager) evictLRULocked() {
 	if oldestID != "" {
 		pm.pools[oldestID].pool.Close()
 		delete(pm.pools, oldestID)
+		delete(pm.projectCache, oldestID)
 	}
 }

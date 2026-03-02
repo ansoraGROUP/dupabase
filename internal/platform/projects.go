@@ -10,35 +10,41 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ansoraGROUP/dupabase/internal/database"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/ansoraGROUP/dupabase/internal/database"
 )
 
 type ProjectService struct {
-	platformDB  *pgxpool.Pool
-	poolManager *database.PoolManager
-	siteURL     string
+	platformDB       *pgxpool.Pool
+	poolManager      *database.PoolManager
+	siteURL          string
+	apiKeyExpiryDays int
 }
 
-func NewProjectService(platformDB *pgxpool.Pool, pm *database.PoolManager, siteURL string) *ProjectService {
+func NewProjectService(platformDB *pgxpool.Pool, pm *database.PoolManager, siteURL string, apiKeyExpiryDays int) *ProjectService {
+	if apiKeyExpiryDays <= 0 {
+		apiKeyExpiryDays = 365
+	}
 	return &ProjectService{
-		platformDB:  platformDB,
-		poolManager: pm,
-		siteURL:     siteURL,
+		platformDB:       platformDB,
+		poolManager:      pm,
+		siteURL:          siteURL,
+		apiKeyExpiryDays: apiKeyExpiryDays,
 	}
 }
 
 type CreateProjectRequest struct {
-	Name             string `json:"name"`
-	EnableSignup     *bool  `json:"enable_signup,omitempty"`
-	Autoconfirm      *bool  `json:"autoconfirm,omitempty"`
+	Name              string `json:"name"`
+	OrgID             string `json:"org_id"`
+	EnableSignup      *bool  `json:"enable_signup,omitempty"`
+	Autoconfirm       *bool  `json:"autoconfirm,omitempty"`
 	PasswordMinLength *int   `json:"password_min_length,omitempty"`
 }
 
 type ProjectSettings struct {
-	EnableSignup     bool `json:"enable_signup"`
-	Autoconfirm      bool `json:"autoconfirm"`
+	EnableSignup      bool `json:"enable_signup"`
+	Autoconfirm       bool `json:"autoconfirm"`
 	PasswordMinLength int  `json:"password_min_length"`
 }
 
@@ -106,11 +112,11 @@ func (s *ProjectService) CreateProject(ctx context.Context, userID string, req C
 
 	err = s.platformDB.QueryRow(ctx, `
 		INSERT INTO platform.projects (user_id, pg_user_id, name, db_name, jwt_secret, anon_key, service_role_key,
-			enable_signup, autoconfirm, password_min_length, site_url, status)
-		VALUES ($1, $2, $3, $4, $5, '', '', $6, $7, $8, $9, 'creating')
+			enable_signup, autoconfirm, password_min_length, site_url, status, org_id)
+		VALUES ($1, $2, $3, $4, $5, '', '', $6, $7, $8, $9, 'creating', $10)
 		RETURNING id, created_at
 	`, userID, pgUserID, name, dbName, jwtSecret,
-		enableSignup, autoconfirm, passwordMinLen, s.siteURL,
+		enableSignup, autoconfirm, passwordMinLen, s.siteURL, req.OrgID,
 	).Scan(&projectID, &createdAt)
 	if err != nil {
 		if strings.Contains(err.Error(), "unique") {
@@ -121,14 +127,25 @@ func (s *ProjectService) CreateProject(ctx context.Context, userID string, req C
 
 	// Create database
 	_, err = s.platformDB.Exec(ctx, fmt.Sprintf(`CREATE DATABASE "%s" OWNER "%s"`, dbName, pgUsername))
-	if err == nil {
-		// Lock down database access — only the owner and superuser can connect
-		s.platformDB.Exec(ctx, fmt.Sprintf(`REVOKE CONNECT ON DATABASE "%s" FROM PUBLIC`, dbName))
-	}
 	if err != nil {
 		// Cleanup
 		s.platformDB.Exec(ctx, `DELETE FROM platform.projects WHERE id = $1`, projectID)
 		return nil, http.StatusInternalServerError, fmt.Errorf("create database: %w", err)
+	}
+
+	// Lock down database access — only the owner and superuser can connect
+	if _, err := s.platformDB.Exec(ctx, fmt.Sprintf(`REVOKE CONNECT ON DATABASE "%s" FROM PUBLIC`, dbName)); err != nil {
+		slog.Error("failed to revoke public connect", "db", dbName, "error", err)
+		s.platformDB.Exec(ctx, `DELETE FROM platform.projects WHERE id = $1`, projectID)
+		s.platformDB.Exec(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS "%s"`, dbName))
+		return nil, http.StatusInternalServerError, fmt.Errorf("secure database: %w", err)
+	}
+
+	// Cleanup function for failures after DB creation
+	cleanupOnError := func() {
+		s.platformDB.Exec(ctx, `DELETE FROM platform.projects WHERE id = $1`, projectID)
+		s.platformDB.Exec(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS "%s"`, dbName))
+		slog.Error("project creation failed, cleaned up", "project_id", projectID, "db", dbName)
 	}
 
 	// Connect to the new database and run migrations
@@ -143,6 +160,7 @@ func (s *ProjectService) CreateProject(ctx context.Context, userID string, req C
 		s.poolManager.InvalidateProjectCache(projectID)
 		projectPool, err = s.poolManager.GetPool(ctx, projectID)
 		if err != nil {
+			cleanupOnError()
 			return nil, http.StatusInternalServerError, fmt.Errorf("connect to new db: %w", err)
 		}
 	}
@@ -150,6 +168,7 @@ func (s *ProjectService) CreateProject(ctx context.Context, userID string, req C
 	// Run project migrations
 	err = database.RunMigrations(ctx, projectPool, projectMigrations())
 	if err != nil {
+		cleanupOnError()
 		return nil, http.StatusInternalServerError, fmt.Errorf("run migrations: %w", err)
 	}
 
@@ -165,12 +184,14 @@ func (s *ProjectService) CreateProject(ctx context.Context, userID string, req C
 	}
 
 	// Generate anon_key and service_role_key
-	anonKey, err := generateProjectAPIKey(jwtSecret, projectID, "anon")
+	anonKey, err := generateProjectAPIKey(jwtSecret, projectID, "anon", s.apiKeyExpiryDays)
 	if err != nil {
+		cleanupOnError()
 		return nil, http.StatusInternalServerError, fmt.Errorf("generate anon key: %w", err)
 	}
-	serviceRoleKey, err := generateProjectAPIKey(jwtSecret, projectID, "service_role")
+	serviceRoleKey, err := generateProjectAPIKey(jwtSecret, projectID, "service_role", s.apiKeyExpiryDays)
 	if err != nil {
+		cleanupOnError()
 		return nil, http.StatusInternalServerError, fmt.Errorf("generate service role key: %w", err)
 	}
 
@@ -181,6 +202,7 @@ func (s *ProjectService) CreateProject(ctx context.Context, userID string, req C
 		WHERE id = $3
 	`, anonKey, serviceRoleKey, projectID)
 	if err != nil {
+		cleanupOnError()
 		return nil, http.StatusInternalServerError, fmt.Errorf("update project keys: %w", err)
 	}
 
@@ -207,15 +229,15 @@ func (s *ProjectService) CreateProject(ctx context.Context, userID string, req C
 	}, http.StatusCreated, nil
 }
 
-// ListProjects returns all projects for a user.
-func (s *ProjectService) ListProjects(ctx context.Context, userID string) ([]ProjectResponse, error) {
+// ListProjects returns all projects for an organization.
+func (s *ProjectService) ListProjects(ctx context.Context, orgID string) ([]ProjectResponse, error) {
 	rows, err := s.platformDB.Query(ctx, `
-		SELECT id, name, db_name, region, anon_key, service_role_key, jwt_secret,
+		SELECT id, name, db_name, region, anon_key, service_role_key, '' AS jwt_secret,
 			status, site_url, enable_signup, autoconfirm, password_min_length, created_at
 		FROM platform.projects
-		WHERE user_id = $1 AND status != 'deleted'
+		WHERE org_id = $1 AND status != 'deleted'
 		ORDER BY created_at DESC
-	`, userID)
+	`, orgID)
 	if err != nil {
 		return nil, err
 	}
@@ -238,17 +260,19 @@ func (s *ProjectService) ListProjects(ctx context.Context, userID string) ([]Pro
 	if projects == nil {
 		projects = []ProjectResponse{}
 	}
+
 	return projects, nil
 }
 
 // DeleteProject drops a database and marks the project as deleted.
-func (s *ProjectService) DeleteProject(ctx context.Context, userID, projectID string) (int, error) {
-	// Verify ownership
+// orgID is used to verify the project belongs to the given organization.
+func (s *ProjectService) DeleteProject(ctx context.Context, orgID, projectID string) (int, error) {
+	// Verify project belongs to org
 	var dbName, status string
 	err := s.platformDB.QueryRow(ctx, `
 		SELECT db_name, status FROM platform.projects
-		WHERE id = $1 AND user_id = $2
-	`, projectID, userID).Scan(&dbName, &status)
+		WHERE id = $1 AND org_id = $2
+	`, projectID, orgID).Scan(&dbName, &status)
 	if err != nil {
 		return http.StatusNotFound, fmt.Errorf("project not found")
 	}
@@ -257,17 +281,21 @@ func (s *ProjectService) DeleteProject(ctx context.Context, userID, projectID st
 	}
 
 	// Set to deleting
-	s.platformDB.Exec(ctx, `UPDATE platform.projects SET status = 'deleting' WHERE id = $1`, projectID)
+	if _, err := s.platformDB.Exec(ctx, `UPDATE platform.projects SET status = 'deleting' WHERE id = $1`, projectID); err != nil {
+		slog.Error("failed to update project status to deleting", "error", err, "project_id", projectID)
+	}
 
 	// Close the pool for this project
 	s.poolManager.ClosePool(projectID)
 
 	// Terminate all connections to the database
-	s.platformDB.Exec(ctx, `
+	if _, err := s.platformDB.Exec(ctx, `
 		SELECT pg_terminate_backend(pid)
 		FROM pg_stat_activity
 		WHERE datname = $1 AND pid != pg_backend_pid()
-	`, dbName)
+	`, dbName); err != nil {
+		slog.Error("failed to terminate connections", "error", err, "project_id", projectID, "db", dbName)
+	}
 
 	// Drop the database
 	_, err = s.platformDB.Exec(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS "%s"`, dbName))
@@ -276,7 +304,9 @@ func (s *ProjectService) DeleteProject(ctx context.Context, userID, projectID st
 	}
 
 	// Mark as deleted
-	s.platformDB.Exec(ctx, `UPDATE platform.projects SET status = 'deleted', updated_at = NOW() WHERE id = $1`, projectID)
+	if _, err := s.platformDB.Exec(ctx, `UPDATE platform.projects SET status = 'deleted', updated_at = NOW() WHERE id = $1`, projectID); err != nil {
+		slog.Error("failed to update project status to deleted", "error", err, "project_id", projectID)
+	}
 
 	return http.StatusOK, nil
 }
@@ -288,15 +318,16 @@ type UpdateSettingsRequest struct {
 }
 
 // UpdateProjectSettings updates settings for a project.
-func (s *ProjectService) UpdateProjectSettings(ctx context.Context, userID, projectID string, req UpdateSettingsRequest) (*ProjectSettings, int, error) {
-	// Verify ownership
+// orgID is used to verify the project belongs to the given organization.
+func (s *ProjectService) UpdateProjectSettings(ctx context.Context, orgID, projectID string, req UpdateSettingsRequest) (*ProjectSettings, int, error) {
+	// Verify project belongs to org
 	var currentSignup, currentAutoconfirm bool
 	var currentMinLen int
 	err := s.platformDB.QueryRow(ctx, `
 		SELECT enable_signup, autoconfirm, password_min_length
 		FROM platform.projects
-		WHERE id = $1 AND user_id = $2 AND status != 'deleted'
-	`, projectID, userID).Scan(&currentSignup, &currentAutoconfirm, &currentMinLen)
+		WHERE id = $1 AND org_id = $2 AND status != 'deleted'
+	`, projectID, orgID).Scan(&currentSignup, &currentAutoconfirm, &currentMinLen)
 	if err != nil {
 		return nil, http.StatusNotFound, fmt.Errorf("project not found")
 	}
@@ -334,8 +365,9 @@ func (s *ProjectService) UpdateProjectSettings(ctx context.Context, userID, proj
 }
 
 // RotateAPIKeys generates new anon_key and service_role_key for a project.
-func (s *ProjectService) RotateAPIKeys(ctx context.Context, userID, projectID string) (*ProjectResponse, int, error) {
-	// Verify ownership and get project data
+// orgID is used to verify the project belongs to the given organization.
+func (s *ProjectService) RotateAPIKeys(ctx context.Context, orgID, projectID string) (*ProjectResponse, int, error) {
+	// Verify project belongs to org and get project data
 	var dbName, jwtSecret, name, siteURL, status string
 	var enableSignup, autoconfirm bool
 	var passwordMinLen int
@@ -343,8 +375,8 @@ func (s *ProjectService) RotateAPIKeys(ctx context.Context, userID, projectID st
 	err := s.platformDB.QueryRow(ctx, `
 		SELECT db_name, jwt_secret, name, site_url, status, enable_signup, autoconfirm, password_min_length, created_at
 		FROM platform.projects
-		WHERE id = $1 AND user_id = $2 AND status = 'active'
-	`, projectID, userID).Scan(&dbName, &jwtSecret, &name, &siteURL, &status, &enableSignup, &autoconfirm, &passwordMinLen, &createdAt)
+		WHERE id = $1 AND org_id = $2 AND status = 'active'
+	`, projectID, orgID).Scan(&dbName, &jwtSecret, &name, &siteURL, &status, &enableSignup, &autoconfirm, &passwordMinLen, &createdAt)
 	if err != nil {
 		return nil, http.StatusNotFound, fmt.Errorf("project not found")
 	}
@@ -357,11 +389,11 @@ func (s *ProjectService) RotateAPIKeys(ctx context.Context, userID, projectID st
 	jwtSecret = hex.EncodeToString(newSecretBytes)
 
 	// Generate new keys with the new secret
-	anonKey, err := generateProjectAPIKey(jwtSecret, projectID, "anon")
+	anonKey, err := generateProjectAPIKey(jwtSecret, projectID, "anon", s.apiKeyExpiryDays)
 	if err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("generate anon key: %w", err)
 	}
-	serviceRoleKey, err := generateProjectAPIKey(jwtSecret, projectID, "service_role")
+	serviceRoleKey, err := generateProjectAPIKey(jwtSecret, projectID, "service_role", s.apiKeyExpiryDays)
 	if err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("generate service role key: %w", err)
 	}
@@ -400,14 +432,14 @@ func (s *ProjectService) RotateAPIKeys(ctx context.Context, userID, projectID st
 }
 
 // generateProjectAPIKey creates a long-lived JWT for a project (anon or service_role).
-func generateProjectAPIKey(jwtSecret, projectID, role string) (string, error) {
+func generateProjectAPIKey(jwtSecret, projectID, role string, expiryDays int) (string, error) {
 	now := time.Now()
 	claims := jwt.MapClaims{
 		"role":       role,
 		"iss":        "supabase",
 		"project_id": projectID,
 		"iat":        now.Unix(),
-		"exp":        now.Add(365 * 24 * time.Hour).Unix(), // 1 year
+		"exp":        now.Add(time.Duration(expiryDays) * 24 * time.Hour).Unix(),
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
@@ -544,6 +576,10 @@ BEGIN
 END $$;
 
 GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role;
+-- WARNING: This grants full CRUD on all public tables to the anon role.
+-- Row Level Security (RLS) policies MUST be defined on user tables to
+-- restrict access. Without RLS, anonymous requests can read/write all data.
+-- Consider using: ALTER TABLE tablename ENABLE ROW LEVEL SECURITY;
 GRANT ALL ON ALL TABLES IN SCHEMA public TO anon, authenticated, service_role;
 GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO anon, authenticated, service_role;
 GRANT ALL ON ALL ROUTINES IN SCHEMA public TO anon, authenticated, service_role;

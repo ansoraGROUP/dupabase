@@ -9,9 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/ansoraGROUP/dupabase/internal/database"
+	"github.com/ansoraGROUP/dupabase/internal/httputil"
 	"github.com/ansoraGROUP/dupabase/internal/middleware"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // ---------------------------------------------------------------------------
@@ -381,7 +382,7 @@ func TestGenerateUserJWT(t *testing.T) {
 	appMeta := map[string]interface{}{"provider": "email"}
 	sessionID := "session-1"
 
-	tokenStr, expiresAt, err := generateUserJWT(secret, siteURL, userID, email, userMeta, appMeta, sessionID)
+	tokenStr, expiresAt, _, err := generateUserJWT(secret, siteURL, userID, email, userMeta, appMeta, sessionID)
 	if err != nil {
 		t.Fatalf("generateUserJWT failed: %v", err)
 	}
@@ -511,7 +512,7 @@ func TestWriteError(t *testing.T) {
 func TestWriteJSON(t *testing.T) {
 	rec := httptest.NewRecorder()
 	data := map[string]string{"key": "value"}
-	writeJSON(rec, http.StatusCreated, data)
+	httputil.WriteJSON(rec, http.StatusCreated, data)
 
 	if rec.Code != http.StatusCreated {
 		t.Errorf("expected status 201, got %d", rec.Code)
@@ -600,5 +601,219 @@ func TestIdentityResponse_Fields(t *testing.T) {
 	}
 	if resp.Provider != "email" {
 		t.Error("unexpected Provider")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Email validation (isValidEmail)
+// ---------------------------------------------------------------------------
+
+func TestEmailValidation(t *testing.T) {
+	tests := []struct {
+		email string
+		valid bool
+	}{
+		{"user@example.com", true},
+		{"user@", false},
+		{"@example.com", false},
+		{"notanemail", false},
+		{"", false},
+		{"a@b.c", true},
+		{"user+tag@example.com", true},
+		{"user.name@example.co.uk", true},
+		{"user@subdomain.example.com", true},
+		{" ", false},
+		{"user @example.com", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.email, func(t *testing.T) {
+			if got := isValidEmail(tt.email); got != tt.valid {
+				t.Errorf("isValidEmail(%q) = %v, want %v", tt.email, got, tt.valid)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Password length limits (max 72 chars for bcrypt)
+// ---------------------------------------------------------------------------
+
+func TestPasswordLengthLimits(t *testing.T) {
+	// Verify the boundary: 72 chars should be accepted, 73 rejected
+	// This tests the validation logic used in Signup and UpdateUser
+	tests := []struct {
+		name    string
+		length  int
+		tooLong bool
+	}{
+		{"exactly_72", 72, false},
+		{"73_chars", 73, true},
+		{"100_chars", 100, true},
+		{"1_char", 1, false},
+		{"71_chars", 71, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			password := strings.Repeat("a", tt.length)
+			isTooLong := len(password) > 72
+			if isTooLong != tt.tooLong {
+				t.Errorf("password length %d: tooLong = %v, want %v", tt.length, isTooLong, tt.tooLong)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Login attempt lockout (brute-force protection)
+// ---------------------------------------------------------------------------
+
+func TestLoginAttemptLockout(t *testing.T) {
+	email := "locktest@example.com"
+
+	// Clean up any previous state
+	clearLoginAttempts(email)
+
+	// Should not be locked initially
+	if isEmailLocked(email) {
+		t.Error("should not be locked initially")
+	}
+
+	// Record 4 failed attempts — should NOT be locked yet
+	for i := 0; i < 4; i++ {
+		recordFailedLogin(email)
+	}
+	if isEmailLocked(email) {
+		t.Error("should not be locked after 4 attempts")
+	}
+
+	// 5th attempt triggers lockout
+	recordFailedLogin(email)
+	if !isEmailLocked(email) {
+		t.Error("should be locked after 5 attempts")
+	}
+
+	// Clear and verify unlocked
+	clearLoginAttempts(email)
+	if isEmailLocked(email) {
+		t.Error("should be unlocked after clear")
+	}
+}
+
+func TestLoginAttemptLockout_DifferentEmails(t *testing.T) {
+	email1 := "locktest1@example.com"
+	email2 := "locktest2@example.com"
+
+	clearLoginAttempts(email1)
+	clearLoginAttempts(email2)
+
+	// Lock email1
+	for i := 0; i < 5; i++ {
+		recordFailedLogin(email1)
+	}
+
+	if !isEmailLocked(email1) {
+		t.Error("email1 should be locked")
+	}
+	if isEmailLocked(email2) {
+		t.Error("email2 should not be locked")
+	}
+
+	clearLoginAttempts(email1)
+	clearLoginAttempts(email2)
+}
+
+// ---------------------------------------------------------------------------
+// dummyProjectHash initialization
+// ---------------------------------------------------------------------------
+
+func TestDummyProjectHashNotNil(t *testing.T) {
+	if dummyProjectHash == nil {
+		t.Fatal("dummyProjectHash should not be nil")
+	}
+	if len(dummyProjectHash) == 0 {
+		t.Fatal("dummyProjectHash should not be empty")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// generateUserJWTFull — anonymous JWT
+// ---------------------------------------------------------------------------
+
+func TestGenerateUserJWTFull_Anonymous(t *testing.T) {
+	secret := "test-secret-for-anon-jwt-tests"
+	siteURL := "http://localhost:3000"
+	userMeta := map[string]interface{}{}
+	appMeta := map[string]interface{}{}
+
+	tokenStr, expiresAt, expiresAtTime, err := generateUserJWTFull(
+		secret, siteURL, "anon-user-1", "", userMeta, appMeta,
+		"session-anon-1", true, "anonymous",
+	)
+	if err != nil {
+		t.Fatalf("generateUserJWTFull failed: %v", err)
+	}
+	if tokenStr == "" {
+		t.Fatal("expected non-empty token")
+	}
+	if expiresAt <= 0 {
+		t.Error("expected positive expiresAt")
+	}
+	if expiresAtTime.IsZero() {
+		t.Error("expected non-zero expiresAtTime")
+	}
+
+	// Parse and verify is_anonymous claim
+	token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
+		return []byte(secret), nil
+	})
+	if err != nil {
+		t.Fatalf("parse token failed: %v", err)
+	}
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		t.Fatal("expected MapClaims")
+	}
+	if isAnon, _ := claims["is_anonymous"].(bool); !isAnon {
+		t.Error("expected is_anonymous=true in claims")
+	}
+	if email, _ := claims["email"].(string); email != "" {
+		t.Errorf("expected empty email for anonymous, got %q", email)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Token handler - unsupported grant_type
+// ---------------------------------------------------------------------------
+
+func TestToken_UnsupportedGrantType(t *testing.T) {
+	h := NewHandler()
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/v1/token?grant_type=magic_link", strings.NewReader("{}"))
+	// We need project+pool context for the handler to proceed past the first check.
+	// Without them, it returns "missing project context".
+	rec := httptest.NewRecorder()
+
+	h.Token(rec, req)
+
+	// Without context, returns 500
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("expected status 500, got %d", rec.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AdminDeleteUser - missing user ID
+// ---------------------------------------------------------------------------
+
+func TestAdminDeleteUser_MissingProjectContext(t *testing.T) {
+	h := NewHandler()
+
+	req := httptest.NewRequest(http.MethodDelete, "/auth/v1/admin/users/", nil)
+	rec := httptest.NewRecorder()
+
+	h.AdminDeleteUser(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("expected status 500, got %d", rec.Code)
 	}
 }

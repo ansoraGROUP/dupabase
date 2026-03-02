@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useAuth } from "@/lib/auth-context";
-import { imports, type ImportTask } from "@/lib/api";
+import { imports, type ImportTask, type DumpAnalysis } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -17,6 +17,10 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Label } from "@/components/ui/label";
 import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Card,
+  CardContent,
+} from "@/components/ui/card";
 import { toast } from "sonner";
 import {
   Upload,
@@ -26,6 +30,7 @@ import {
   Loader2,
   Info,
   X,
+  Database,
 } from "lucide-react";
 
 const ACCEPTED_EXTENSIONS = [".sql", ".dump", ".backup", ".tar"];
@@ -46,8 +51,12 @@ export function ImportDialog({ projectId, onComplete }: ImportDialogProps) {
   const [cleanImport, setCleanImport] = useState(false);
   const [skipAuth, setSkipAuth] = useState(true);
   const [disableTriggers, setDisableTriggers] = useState(true);
+  const [migrateAuthUsers, setMigrateAuthUsers] = useState(false);
+  const [analysis, setAnalysis] = useState<DumpAnalysis | null>(null);
+  const [analyzing, setAnalyzing] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pollRef = useRef<NodeJS.Timeout | null>(null);
+  const analyzeAbortRef = useRef(false);
 
   const resetState = useCallback(() => {
     setFile(null);
@@ -56,11 +65,53 @@ export function ImportDialog({ projectId, onComplete }: ImportDialogProps) {
     setCleanImport(false);
     setSkipAuth(true);
     setDisableTriggers(true);
+    setMigrateAuthUsers(false);
+    setAnalysis(null);
+    setAnalyzing(false);
+    analyzeAbortRef.current = true;
     if (pollRef.current) {
       clearInterval(pollRef.current);
       pollRef.current = null;
     }
   }, []);
+
+  // Analyze the file when it's selected
+  useEffect(() => {
+    if (!file || !token) {
+      setAnalysis(null);
+      setAnalyzing(false);
+      return;
+    }
+
+    let cancelled = false;
+    analyzeAbortRef.current = false;
+
+    const runAnalysis = async () => {
+      setAnalyzing(true);
+      setAnalysis(null);
+      const { data, error } = await imports.analyze(token, projectId, file);
+      if (cancelled || analyzeAbortRef.current) return;
+      if (error) {
+        // Analysis failure is non-blocking, just stop the spinner
+        setAnalyzing(false);
+        return;
+      }
+      if (data) {
+        setAnalysis(data);
+        // Auto-check migrate auth users if Supabase dump with auth users
+        if (data.is_supabase_dump && data.has_auth_users) {
+          setMigrateAuthUsers(true);
+        }
+      }
+      setAnalyzing(false);
+    };
+
+    runAnalysis();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [file, token, projectId]);
 
   // Poll for status
   useEffect(() => {
@@ -130,6 +181,7 @@ export function ImportDialog({ projectId, onComplete }: ImportDialogProps) {
       clean_import: cleanImport,
       skip_auth_schema: skipAuth,
       disable_triggers: disableTriggers,
+      migrate_auth_users: migrateAuthUsers,
     });
 
     if (error) {
@@ -226,6 +278,8 @@ export function ImportDialog({ projectId, onComplete }: ImportDialogProps) {
                     onClick={(e) => {
                       e.stopPropagation();
                       setFile(null);
+                      setAnalysis(null);
+                      setMigrateAuthUsers(false);
                     }}
                   >
                     <X className="h-3.5 w-3.5" />
@@ -243,6 +297,64 @@ export function ImportDialog({ projectId, onComplete }: ImportDialogProps) {
                 </>
               )}
             </div>
+
+            {/* Analysis results */}
+            {file && analyzing && (
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                <span>Analyzing dump file...</span>
+              </div>
+            )}
+
+            {file && !analyzing && analysis && analysis.is_supabase_dump && (
+              <Card className="border-blue-500/30 bg-blue-500/5">
+                <CardContent className="p-4 space-y-3">
+                  <div className="flex items-center gap-2">
+                    <Database className="h-4 w-4 text-blue-500" />
+                    <Badge variant="secondary" className="bg-blue-500/10 text-blue-600 border-blue-500/20">
+                      Supabase dump detected
+                    </Badge>
+                  </div>
+
+                  {analysis.detected_signals.length > 0 && (
+                    <div className="space-y-1">
+                      <p className="text-xs font-medium text-muted-foreground">Detected signals:</p>
+                      <ul className="text-xs text-muted-foreground space-y-0.5">
+                        {analysis.detected_signals.map((signal, i) => (
+                          <li key={i} className="flex items-center gap-1.5">
+                            <span className="h-1 w-1 rounded-full bg-blue-500 shrink-0" />
+                            {signal}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  {analysis.supabase_schemas.length > 0 && (
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span className="text-xs text-muted-foreground">Schemas:</span>
+                      {analysis.supabase_schemas.map((schema) => (
+                        <Badge key={schema} variant="outline" className="text-[10px] font-mono">
+                          {schema}
+                        </Badge>
+                      ))}
+                    </div>
+                  )}
+
+                  {analysis.recommended_action && (
+                    <p className="text-xs text-muted-foreground italic">
+                      {analysis.recommended_action}
+                    </p>
+                  )}
+                </CardContent>
+              </Card>
+            )}
+
+            {file && !analyzing && analysis && !analysis.is_supabase_dump && (
+              <p className="text-xs text-muted-foreground">
+                Standard PostgreSQL dump
+              </p>
+            )}
 
             {/* Options */}
             <div className="space-y-3">
@@ -266,6 +378,18 @@ export function ImportDialog({ projectId, onComplete }: ImportDialogProps) {
                   Disable triggers during import
                 </Label>
               </div>
+              {analysis?.has_auth_users && (
+                <div className="flex items-center space-x-2">
+                  <Checkbox
+                    id="migrate-auth-users"
+                    checked={migrateAuthUsers}
+                    onCheckedChange={(c) => setMigrateAuthUsers(!!c)}
+                  />
+                  <Label htmlFor="migrate-auth-users" className="text-sm">
+                    Migrate auth users to Dupabase
+                  </Label>
+                </div>
+              )}
               <div className="flex items-center space-x-2">
                 <Checkbox
                   id="clean-import"

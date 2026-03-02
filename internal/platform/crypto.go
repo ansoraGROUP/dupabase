@@ -3,10 +3,11 @@ package platform
 import (
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/rand"
+	cryptoRand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"math/big"
 	"strings"
 
 	"golang.org/x/crypto/pbkdf2"
@@ -14,17 +15,19 @@ import (
 
 const pbkdf2Iterations = 310_000
 
-// GenerateRandomPassword generates a random alphanumeric password of given length.
+// GenerateRandomPassword generates a random password of given length using unbiased selection.
 func GenerateRandomPassword(length int) (string, error) {
-	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	b := make([]byte, length)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
+	const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*"
+	result := make([]byte, length)
+	max := big.NewInt(int64(len(chars)))
+	for i := range result {
+		n, err := cryptoRand.Int(cryptoRand.Reader, max)
+		if err != nil {
+			return "", fmt.Errorf("crypto/rand failed: %w", err)
+		}
+		result[i] = chars[n.Int64()]
 	}
-	for i := range b {
-		b[i] = charset[int(b[i])%len(charset)]
-	}
-	return string(b), nil
+	return string(result), nil
 }
 
 // EncryptPgPassword encrypts a PG password using AES-256-GCM with a key
@@ -32,7 +35,7 @@ func GenerateRandomPassword(length int) (string, error) {
 // Returns the encrypted string in format: salt:iv:authTag:ciphertext (all hex).
 func EncryptPgPassword(pgPassword, platformPassword string) (string, error) {
 	salt := make([]byte, 16)
-	if _, err := rand.Read(salt); err != nil {
+	if _, err := cryptoRand.Read(salt); err != nil {
 		return "", fmt.Errorf("generate salt: %w", err)
 	}
 
@@ -49,7 +52,7 @@ func EncryptPgPassword(pgPassword, platformPassword string) (string, error) {
 	}
 
 	iv := make([]byte, gcm.NonceSize())
-	if _, err := rand.Read(iv); err != nil {
+	if _, err := cryptoRand.Read(iv); err != nil {
 		return "", fmt.Errorf("generate IV: %w", err)
 	}
 

@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/lib/auth-context";
+import { useOrg } from "@/lib/org-context";
 import { projects as projectsApi, type Project } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import {
@@ -57,6 +58,7 @@ import Link from "next/link";
 
 export default function ProjectsPage() {
   const { token } = useAuth();
+  const { activeOrg } = useOrg();
   const router = useRouter();
   const [items, setItems] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
@@ -67,14 +69,14 @@ export default function ProjectsPage() {
 
   const load = useCallback(async () => {
     if (!token) return;
-    const { data, error } = await projectsApi.list(token);
+    const { data, error } = await projectsApi.list(token, activeOrg?.id);
     if (error) {
       toast.error(error);
     } else {
       setItems(data || []);
     }
     setLoading(false);
-  }, [token]);
+  }, [token, activeOrg?.id]);
 
   useEffect(() => {
     load();
@@ -83,7 +85,7 @@ export default function ProjectsPage() {
   const handleCreate = async () => {
     if (!token || !newName.trim()) return;
     setCreating(true);
-    const { data, error } = await projectsApi.create(token, newName.trim());
+    const { data, error } = await projectsApi.create(token, newName.trim(), activeOrg?.id);
     setCreating(false);
     if (error) {
       toast.error(error);
