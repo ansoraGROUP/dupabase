@@ -183,14 +183,14 @@ func (s *ImportService) StartImport(ctx context.Context, userID, projectID, file
 }
 
 // GetImportStatus returns the latest import task for a project.
-func (s *ImportService) GetImportStatus(ctx context.Context, userID, projectID string, taskID int64) (*ImportTaskResponse, int, error) {
+func (s *ImportService) GetImportStatus(ctx context.Context, projectID string, taskID int64) (*ImportTaskResponse, int, error) {
 	var t ImportTaskResponse
 	err := s.db.QueryRow(ctx, `
 		SELECT id, project_id, db_name, file_name, file_size, format,
 			status, error_message, tables_imported, started_at, completed_at
 		FROM platform.import_tasks
-		WHERE id = $1 AND project_id = $2 AND user_id = $3
-	`, taskID, projectID, userID).Scan(
+		WHERE id = $1 AND project_id = $2
+	`, taskID, projectID).Scan(
 		&t.ID, &t.ProjectID, &t.DBName, &t.FileName, &t.FileSize, &t.Format,
 		&t.Status, &t.ErrorMessage, &t.TablesImported, &t.StartedAt, &t.CompletedAt,
 	)
@@ -201,24 +201,16 @@ func (s *ImportService) GetImportStatus(ctx context.Context, userID, projectID s
 }
 
 // GetImportHistory returns all import tasks for a project.
-func (s *ImportService) GetImportHistory(ctx context.Context, userID, projectID string) ([]ImportTaskResponse, int, error) {
-	// Verify ownership
-	var exists bool
-	err := s.db.QueryRow(ctx, `
-		SELECT EXISTS(SELECT 1 FROM platform.projects WHERE id = $1 AND user_id = $2)
-	`, projectID, userID).Scan(&exists)
-	if err != nil || !exists {
-		return nil, http.StatusNotFound, fmt.Errorf("project not found")
-	}
-
+// Auth is handled at the handler level via org membership checks.
+func (s *ImportService) GetImportHistory(ctx context.Context, projectID string) ([]ImportTaskResponse, int, error) {
 	rows, err := s.db.Query(ctx, `
 		SELECT id, project_id, db_name, file_name, file_size, format,
 			status, error_message, tables_imported, started_at, completed_at
 		FROM platform.import_tasks
-		WHERE project_id = $1 AND user_id = $2
+		WHERE project_id = $1
 		ORDER BY started_at DESC
 		LIMIT 50
-	`, projectID, userID)
+	`, projectID)
 	if err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("query import history: %w", err)
 	}
@@ -240,13 +232,13 @@ func (s *ImportService) GetImportHistory(ctx context.Context, userID, projectID 
 }
 
 // CancelImport cancels a running import.
-func (s *ImportService) CancelImport(ctx context.Context, userID string, taskID int64) (int, error) {
-	// Verify ownership and running status
+func (s *ImportService) CancelImport(ctx context.Context, taskID int64) (int, error) {
+	// Verify running status
 	var status string
 	err := s.db.QueryRow(ctx, `
 		SELECT status FROM platform.import_tasks
-		WHERE id = $1 AND user_id = $2
-	`, taskID, userID).Scan(&status)
+		WHERE id = $1
+	`, taskID).Scan(&status)
 	if err != nil {
 		return http.StatusNotFound, fmt.Errorf("import task not found")
 	}

@@ -217,6 +217,10 @@ func (s *OrgService) UpdateOrg(ctx context.Context, orgID string, req UpdateOrgR
 		current.Name = name
 	}
 	if req.Slug != nil {
+		// Prevent renaming personal org slugs
+		if strings.HasPrefix(current.Slug, "personal-") {
+			return nil, http.StatusBadRequest, fmt.Errorf("cannot rename personal organization slug")
+		}
 		slug := strings.TrimSpace(*req.Slug)
 		if !orgSlugRegex.MatchString(slug) {
 			return nil, http.StatusBadRequest, fmt.Errorf("slug must be 3-50 lowercase letters, numbers, or hyphens, starting with a letter")
@@ -240,20 +244,12 @@ func (s *OrgService) UpdateOrg(ctx context.Context, orgID string, req UpdateOrgR
 	return &current, http.StatusOK, nil
 }
 
-// DeleteOrg deletes an organization. Caller must be owner. Personal orgs cannot be deleted.
-func (s *OrgService) DeleteOrg(ctx context.Context, orgID, userID string) (int, error) {
-	// Verify caller is owner
-	role, err := s.CheckOrgRole(ctx, orgID, userID)
-	if err != nil {
-		return http.StatusForbidden, fmt.Errorf("not a member of this organization")
-	}
-	if role != "owner" {
-		return http.StatusForbidden, fmt.Errorf("only the owner can delete an organization")
-	}
-
+// DeleteOrg deletes an organization. Caller must have verified owner role at the handler level.
+// Personal orgs cannot be deleted.
+func (s *OrgService) DeleteOrg(ctx context.Context, orgID string) (int, error) {
 	// Check if personal org
 	var slug string
-	err = s.db.QueryRow(ctx, `SELECT slug FROM platform.organizations WHERE id = $1`, orgID).Scan(&slug)
+	err := s.db.QueryRow(ctx, `SELECT slug FROM platform.organizations WHERE id = $1`, orgID).Scan(&slug)
 	if err != nil {
 		return http.StatusNotFound, fmt.Errorf("organization not found")
 	}
@@ -261,8 +257,15 @@ func (s *OrgService) DeleteOrg(ctx context.Context, orgID, userID string) (int, 
 		return http.StatusBadRequest, fmt.Errorf("cannot delete personal organization")
 	}
 
+	// Atomic: mark projects deleted + delete org in a single transaction
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return http.StatusInternalServerError, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
 	// Mark projects as deleted (don't DROP databases)
-	_, err = s.db.Exec(ctx, `
+	_, err = tx.Exec(ctx, `
 		UPDATE platform.projects SET status = 'deleted', updated_at = NOW()
 		WHERE org_id = $1 AND status != 'deleted'
 	`, orgID)
@@ -271,9 +274,13 @@ func (s *OrgService) DeleteOrg(ctx context.Context, orgID, userID string) (int, 
 	}
 
 	// Delete org (CASCADE handles members + invites)
-	_, err = s.db.Exec(ctx, `DELETE FROM platform.organizations WHERE id = $1`, orgID)
+	_, err = tx.Exec(ctx, `DELETE FROM platform.organizations WHERE id = $1`, orgID)
 	if err != nil {
 		return http.StatusInternalServerError, fmt.Errorf("delete org: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return http.StatusInternalServerError, fmt.Errorf("commit: %w", err)
 	}
 
 	return http.StatusOK, nil
@@ -341,6 +348,21 @@ func (s *OrgService) CreateInvite(ctx context.Context, orgID, inviterID string, 
 		return nil, http.StatusConflict, fmt.Errorf("user is already a member of this organization")
 	}
 
+	// Check for existing pending invite
+	var pendingExists bool
+	err = s.db.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM platform.org_invites
+			WHERE org_id = $1 AND email = $2 AND accepted_at IS NULL AND expires_at > now()
+		)
+	`, orgID, email).Scan(&pendingExists)
+	if err != nil {
+		return nil, http.StatusInternalServerError, fmt.Errorf("check pending invite: %w", err)
+	}
+	if pendingExists {
+		return nil, http.StatusConflict, fmt.Errorf("a pending invite already exists for this email")
+	}
+
 	// Generate 32-byte hex token
 	tokenBytes := make([]byte, 32)
 	if _, err := rand.Read(tokenBytes); err != nil {
@@ -367,6 +389,7 @@ func (s *OrgService) CreateInvite(ctx context.Context, orgID, inviterID string, 
 }
 
 // AcceptInvite accepts an organization invite by token.
+// The accepting user's email must match the invite email (prevents token theft).
 func (s *OrgService) AcceptInvite(ctx context.Context, userID, token string) (*Organization, int, error) {
 	var invite OrgInvite
 	err := s.db.QueryRow(ctx, `
@@ -387,6 +410,16 @@ func (s *OrgService) AcceptInvite(ctx context.Context, userID, token string) (*O
 		return nil, http.StatusBadRequest, fmt.Errorf("invite has expired")
 	}
 
+	// Email binding: verify the accepting user's email matches the invite
+	var userEmail string
+	err = s.db.QueryRow(ctx, `SELECT email FROM platform.users WHERE id = $1`, userID).Scan(&userEmail)
+	if err != nil {
+		return nil, http.StatusInternalServerError, fmt.Errorf("lookup user email: %w", err)
+	}
+	if !strings.EqualFold(userEmail, invite.Email) {
+		return nil, http.StatusForbidden, fmt.Errorf("invite is for a different email address")
+	}
+
 	// Check user not already a member
 	var alreadyMember bool
 	err = s.db.QueryRow(ctx, `
@@ -399,11 +432,25 @@ func (s *OrgService) AcceptInvite(ctx context.Context, userID, token string) (*O
 		return nil, http.StatusConflict, fmt.Errorf("already a member of this organization")
 	}
 
+	// Atomic accept: mark invite accepted + insert member in one transaction.
+	// The UPDATE with accepted_at IS NULL prevents the race where two concurrent
+	// accepts both pass the nil check above.
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback(ctx)
+
+	var acceptedID string
+	err = tx.QueryRow(ctx, `
+		UPDATE platform.org_invites
+		SET accepted_at = now()
+		WHERE id = $1 AND accepted_at IS NULL
+		RETURNING id
+	`, invite.ID).Scan(&acceptedID)
+	if err != nil {
+		return nil, http.StatusBadRequest, fmt.Errorf("invite already accepted")
+	}
 
 	_, err = tx.Exec(ctx, `
 		INSERT INTO platform.org_members (org_id, user_id, role)
@@ -411,13 +458,6 @@ func (s *OrgService) AcceptInvite(ctx context.Context, userID, token string) (*O
 	`, invite.OrgID, userID, invite.Role)
 	if err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("insert member: %w", err)
-	}
-
-	_, err = tx.Exec(ctx, `
-		UPDATE platform.org_invites SET accepted_at = now() WHERE id = $1
-	`, invite.ID)
-	if err != nil {
-		return nil, http.StatusInternalServerError, fmt.Errorf("mark invite accepted: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -558,4 +598,36 @@ func (s *OrgService) GetPersonalOrgID(ctx context.Context, userID string) (strin
 		return "", fmt.Errorf("personal org not found for user %s", userID)
 	}
 	return orgID, nil
+}
+
+// LeaveOrg removes the calling user from an organization.
+// Owners cannot leave (must transfer ownership first). Personal orgs cannot be left.
+func (s *OrgService) LeaveOrg(ctx context.Context, orgID, userID string) (int, error) {
+	// Check membership and role
+	role, err := s.CheckOrgRole(ctx, orgID, userID)
+	if err != nil {
+		return http.StatusForbidden, fmt.Errorf("not a member of this organization")
+	}
+	if role == "owner" {
+		return http.StatusBadRequest, fmt.Errorf("owner cannot leave; transfer ownership first")
+	}
+
+	// Check if personal org
+	var slug string
+	err = s.db.QueryRow(ctx, `SELECT slug FROM platform.organizations WHERE id = $1`, orgID).Scan(&slug)
+	if err != nil {
+		return http.StatusNotFound, fmt.Errorf("organization not found")
+	}
+	if strings.HasPrefix(slug, "personal-") {
+		return http.StatusBadRequest, fmt.Errorf("cannot leave personal organization")
+	}
+
+	_, err = s.db.Exec(ctx, `
+		DELETE FROM platform.org_members WHERE org_id = $1 AND user_id = $2
+	`, orgID, userID)
+	if err != nil {
+		return http.StatusInternalServerError, fmt.Errorf("leave org: %w", err)
+	}
+
+	return http.StatusOK, nil
 }

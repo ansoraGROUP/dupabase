@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -342,12 +344,14 @@ type TestS3ConnectionRequest struct {
 	S3Bucket    string `json:"s3_bucket"`
 	S3AccessKey string `json:"s3_access_key"`
 	S3SecretKey string `json:"s3_secret_key"`
+	OrgID       string `json:"org_id,omitempty"`
 }
 
 // ToggleBackupRequest is the request body for enabling/disabling backups.
 type ToggleBackupRequest struct {
 	Enabled          bool   `json:"enabled"`
 	PlatformPassword string `json:"platform_password"`
+	OrgID            string `json:"org_id,omitempty"`
 }
 
 // RestoreBackupRequest is the request body for restoring a backup.
@@ -402,7 +406,8 @@ func (s *BackupService) TestS3Connection(ctx context.Context, req TestS3Connecti
 }
 
 // ToggleEnabled enables or disables backups after password verification.
-func (s *BackupService) ToggleEnabled(ctx context.Context, userID string, req ToggleBackupRequest) (*BackupSettingsResponse, int, error) {
+// orgID determines which org's backup settings to toggle.
+func (s *BackupService) ToggleEnabled(ctx context.Context, userID, orgID string, req ToggleBackupRequest) (*BackupSettingsResponse, int, error) {
 	if req.PlatformPassword == "" {
 		return nil, http.StatusBadRequest, fmt.Errorf("platform_password is required")
 	}
@@ -417,15 +422,15 @@ func (s *BackupService) ToggleEnabled(ctx context.Context, userID string, req To
 		return nil, http.StatusUnauthorized, fmt.Errorf("invalid password")
 	}
 
-	// Update enabled flag
+	// Update enabled flag scoped to org
 	var resp BackupSettingsResponse
 	err = s.db.QueryRow(ctx, `
 		UPDATE platform.backup_settings
 		SET enabled = $1, updated_at = NOW()
-		WHERE user_id = $2
+		WHERE org_id = $2
 		RETURNING id, s3_endpoint, s3_region, s3_bucket, s3_path_prefix,
 			schedule, retention_days, project_ids, enabled
-	`, req.Enabled, userID).Scan(
+	`, req.Enabled, orgID).Scan(
 		&resp.ID, &resp.S3Endpoint, &resp.S3Region, &resp.S3Bucket,
 		&resp.S3PathPrefix, &resp.Schedule, &resp.RetentionDays, &resp.ProjectIDs, &resp.Enabled,
 	)
@@ -438,16 +443,100 @@ func (s *BackupService) ToggleEnabled(ctx context.Context, userID string, req To
 	return &resp, http.StatusOK, nil
 }
 
-// ExportDatabase runs pg_dump in the requested format and returns a reader + filename.
-func (s *BackupService) ExportDatabase(ctx context.Context, dbName, format string) (io.ReadCloser, string, error) {
-	reader, err := s.dumpDatabase(ctx, dbName, format)
+// ExportOptions controls pg_dump behavior for database exports.
+type ExportOptions struct {
+	Format        string   // custom, plain/sql
+	SchemaOnly    bool     // --schema-only
+	DataOnly      bool     // --data-only
+	Tables        []string // --table=X
+	ExcludeTables []string // --exclude-table=X
+	ExcludeAuth   bool     // --exclude-schema=auth
+	Inserts       bool     // --inserts
+	Compress      int      // -Z 0-9 (plain format only)
+}
+
+// safeExportIdentifierRe validates table/schema names to prevent injection.
+var safeExportIdentifierRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_.]{0,126}$`)
+
+// isSafeExportIdentifier checks if a string is a safe SQL identifier for pg_dump args.
+func isSafeExportIdentifier(s string) bool {
+	return safeExportIdentifierRe.MatchString(s)
+}
+
+// validateExportOptions checks for invalid option combinations and SQL injection.
+func validateExportOptions(opts ExportOptions) error {
+	if opts.SchemaOnly && opts.DataOnly {
+		return fmt.Errorf("schema_only and data_only are mutually exclusive")
+	}
+	for _, t := range opts.Tables {
+		if !isSafeExportIdentifier(t) {
+			return fmt.Errorf("invalid table name: %q", t)
+		}
+	}
+	for _, t := range opts.ExcludeTables {
+		if !isSafeExportIdentifier(t) {
+			return fmt.Errorf("invalid exclude table name: %q", t)
+		}
+	}
+	if opts.Compress < 0 || opts.Compress > 9 {
+		return fmt.Errorf("compress must be between 0 and 9")
+	}
+	return nil
+}
+
+// buildExportArgs constructs pg_dump arguments from connection info and export options.
+func buildExportArgs(host, port, user, dbName string, opts ExportOptions) []string {
+	pgFormat := "custom"
+	if opts.Format == "plain" || opts.Format == "sql" {
+		pgFormat = "plain"
+	}
+
+	args := []string{
+		"--format=" + pgFormat,
+		"--no-owner",
+		"--no-acl",
+		"--host=" + host, "--port=" + port, "--username=" + user, "--dbname=" + dbName,
+	}
+
+	if opts.SchemaOnly {
+		args = append(args, "--schema-only")
+	}
+	if opts.DataOnly {
+		args = append(args, "--data-only")
+	}
+	for _, t := range opts.Tables {
+		args = append(args, "--table="+t)
+	}
+	for _, t := range opts.ExcludeTables {
+		args = append(args, "--exclude-table="+t)
+	}
+	if opts.ExcludeAuth {
+		args = append(args, "--exclude-schema=auth")
+	}
+	if opts.Inserts {
+		args = append(args, "--inserts")
+	}
+	if opts.Compress > 0 && pgFormat == "plain" {
+		args = append(args, "-Z", strconv.Itoa(opts.Compress))
+	}
+
+	return args
+}
+
+// ExportDatabase runs pg_dump with the given options and returns a reader + filename.
+func (s *BackupService) ExportDatabase(ctx context.Context, dbName string, opts ExportOptions) (io.ReadCloser, string, error) {
+	if err := validateExportOptions(opts); err != nil {
+		return nil, "", err
+	}
+
+	reader, err := s.dumpDatabase(ctx, dbName, opts)
 	if err != nil {
 		return nil, "", err
 	}
 
 	now := time.Now().UTC()
 	ext := ".dump"
-	if format == "plain" || format == "sql" {
+	if opts.Format == "plain" || opts.Format == "sql" {
 		ext = ".sql"
 	}
 	filename := fmt.Sprintf("%s_%s%s", dbName, now.Format("2006-01-02T15-04-05Z"), ext)
@@ -788,7 +877,7 @@ func (s *BackupService) runSingleBackup(ctx context.Context, userID, projectID, 
 	}
 
 	// Run pg_dump
-	reader, err := s.dumpDatabase(ctx, dbName, "custom")
+	reader, err := s.dumpDatabase(ctx, dbName, ExportOptions{Format: "custom"})
 	if err != nil {
 		if ctx.Err() != nil {
 			s.markBackupCancelled(ctx, historyID)
@@ -866,8 +955,7 @@ func (s *BackupService) deleteS3Object(ctx context.Context, settings *backupSett
 }
 
 // dumpDatabase runs pg_dump for a specific database and returns a reader of the output.
-// format: "custom" → --format=custom (.dump), "plain"/"sql" → --format=plain (.sql)
-func (s *BackupService) dumpDatabase(ctx context.Context, dbName, format string) (io.ReadCloser, error) {
+func (s *BackupService) dumpDatabase(ctx context.Context, dbName string, opts ExportOptions) (io.ReadCloser, error) {
 	u, err := url.Parse(s.databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse database URL: %w", err)
@@ -882,17 +970,9 @@ func (s *BackupService) dumpDatabase(ctx context.Context, dbName, format string)
 	user := u.User.Username()
 	password, _ := u.User.Password()
 
-	pgFormat := "custom"
-	if format == "plain" || format == "sql" {
-		pgFormat = "plain"
-	}
+	args := buildExportArgs(host, port, user, dbName, opts)
 
-	cmd := exec.CommandContext(ctx, "pg_dump",
-		"--format="+pgFormat,
-		"--no-owner",
-		"--no-acl",
-		"--host="+host, "--port="+port, "--username="+user, "--dbname="+dbName,
-	)
+	cmd := exec.CommandContext(ctx, "pg_dump", args...)
 	cmd.Env = append(os.Environ(), "PGPASSWORD="+password)
 
 	stdout, err := cmd.StdoutPipe()

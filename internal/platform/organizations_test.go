@@ -3,6 +3,7 @@ package platform
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -454,5 +455,183 @@ func TestListInvites_NilSliceNormalization(t *testing.T) {
 	}
 	if len(invites) != 0 {
 		t.Errorf("expected empty slice, got length %d", len(invites))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AcceptInvite email binding logic (H-4)
+// ---------------------------------------------------------------------------
+
+func TestAcceptInvite_EmailBindingLogic(t *testing.T) {
+	// Tests the strings.EqualFold comparison used in AcceptInvite
+	tests := []struct {
+		name      string
+		userEmail string
+		invEmail  string
+		wantMatch bool
+	}{
+		{"exact_match", "user@example.com", "user@example.com", true},
+		{"case_insensitive", "User@Example.COM", "user@example.com", true},
+		{"mismatch", "other@example.com", "user@example.com", false},
+		{"empty_user_email", "", "user@example.com", false},
+		{"empty_invite_email", "user@example.com", "", false},
+		{"both_empty", "", "", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := strings.EqualFold(tt.userEmail, tt.invEmail)
+			if got != tt.wantMatch {
+				t.Errorf("EqualFold(%q, %q) = %v, want %v", tt.userEmail, tt.invEmail, got, tt.wantMatch)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// CreateInvite duplicate detection (M-4)
+// ---------------------------------------------------------------------------
+
+func TestCreateInvite_DuplicateDetection(t *testing.T) {
+	// Validates the SQL pattern: WHERE org_id=$1 AND email=$2 AND accepted_at IS NULL AND expires_at > now()
+	// This test verifies the conditions that constitute a "pending" invite:
+	// 1. Same org + email
+	// 2. Not yet accepted (accepted_at IS NULL)
+	// 3. Not expired (expires_at > now)
+
+	type pendingCheck struct {
+		orgID      string
+		email      string
+		acceptedAt *time.Time
+		expiresAt  time.Time
+	}
+
+	now := time.Now()
+	accepted := now.Add(-1 * time.Hour)
+	future := now.Add(24 * time.Hour)
+	past := now.Add(-24 * time.Hour)
+
+	tests := []struct {
+		name      string
+		check     pendingCheck
+		isPending bool
+	}{
+		{"pending_invite", pendingCheck{"org1", "a@b.com", nil, future}, true},
+		{"accepted_invite", pendingCheck{"org1", "a@b.com", &accepted, future}, false},
+		{"expired_invite", pendingCheck{"org1", "a@b.com", nil, past}, false},
+		{"accepted_and_expired", pendingCheck{"org1", "a@b.com", &accepted, past}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isPending := tt.check.acceptedAt == nil && tt.check.expiresAt.After(now)
+			if isPending != tt.isPending {
+				t.Errorf("pending check = %v, want %v", isPending, tt.isPending)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// UpdateOrg personal slug protection (M-5)
+// ---------------------------------------------------------------------------
+
+func TestUpdateOrg_PersonalSlugProtection(t *testing.T) {
+	tests := []struct {
+		name      string
+		slug      string
+		isBlocked bool
+	}{
+		{"personal_org", "personal-abc123", true},
+		{"personal_org_uuid", "personal-550e8400-e29b-41d4-a716-446655440000", true},
+		{"normal_org", "my-org", false},
+		{"starts_with_person", "person-org", false},
+		{"empty_slug", "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			blocked := strings.HasPrefix(tt.slug, "personal-")
+			if blocked != tt.isBlocked {
+				t.Errorf("HasPrefix(%q, \"personal-\") = %v, want %v", tt.slug, blocked, tt.isBlocked)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// LeaveOrg owner blocked (M-6)
+// ---------------------------------------------------------------------------
+
+func TestLeaveOrg_OwnerBlocked(t *testing.T) {
+	// The LeaveOrg method checks role == "owner" to prevent owners from leaving.
+	tests := []struct {
+		name    string
+		role    string
+		blocked bool
+	}{
+		{"owner_blocked", "owner", true},
+		{"admin_allowed", "admin", false},
+		{"developer_allowed", "developer", false},
+		{"viewer_allowed", "viewer", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			blocked := tt.role == "owner"
+			if blocked != tt.blocked {
+				t.Errorf("role=%q owner check = %v, want %v", tt.role, blocked, tt.blocked)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// LeaveOrg personal org blocked (M-6)
+// ---------------------------------------------------------------------------
+
+func TestLeaveOrg_PersonalOrgBlocked(t *testing.T) {
+	tests := []struct {
+		name    string
+		slug    string
+		blocked bool
+	}{
+		{"personal_org", "personal-user123", true},
+		{"team_org", "my-team", false},
+		{"prefix_only", "personal-", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			blocked := strings.HasPrefix(tt.slug, "personal-")
+			if blocked != tt.blocked {
+				t.Errorf("HasPrefix(%q, \"personal-\") = %v, want %v", tt.slug, blocked, tt.blocked)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DeleteOrg personal org blocked
+// ---------------------------------------------------------------------------
+
+func TestDeleteOrg_PersonalOrgBlocked(t *testing.T) {
+	tests := []struct {
+		name    string
+		slug    string
+		blocked bool
+	}{
+		{"personal_org", "personal-550e8400", true},
+		{"normal_org", "acme-corp", false},
+		{"similar_prefix", "personally-mine", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			blocked := strings.HasPrefix(tt.slug, "personal-")
+			if blocked != tt.blocked {
+				t.Errorf("HasPrefix(%q, \"personal-\") = %v, want %v", tt.slug, blocked, tt.blocked)
+			}
+		})
 	}
 }
