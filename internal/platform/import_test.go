@@ -802,6 +802,278 @@ func TestDetectFormat(t *testing.T) {
 // supabaseAuthUser type
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// parseInsertIntoAuthUsers
+// ---------------------------------------------------------------------------
+
+func TestParseInsertIntoAuthUsers(t *testing.T) {
+	tests := []struct {
+		name      string
+		stmt      string
+		wantCount int
+		wantFirst map[string]string // check first user's fields
+	}{
+		{
+			"single_row",
+			`INSERT INTO auth.users (id, email, encrypted_password) VALUES ('uuid-1', 'a@b.com', '$2a$12$hash');`,
+			1,
+			map[string]string{"id": "uuid-1", "email": "a@b.com", "encrypted_password": "$2a$12$hash"},
+		},
+		{
+			"multi_row",
+			`INSERT INTO auth.users (id, email) VALUES ('uuid-1', 'a@b.com'), ('uuid-2', 'c@d.com');`,
+			2,
+			map[string]string{"id": "uuid-1", "email": "a@b.com"},
+		},
+		{
+			"malformed_no_values",
+			`INSERT INTO auth.users (id, email) RETURNING id;`,
+			0,
+			nil,
+		},
+		{
+			"no_columns",
+			`INSERT INTO auth.users;`,
+			0,
+			nil,
+		},
+		{
+			"with_type_casts",
+			`INSERT INTO auth.users (id, email, raw_app_meta_data) VALUES ('uuid-1'::uuid, 'a@b.com', '{"p":"email"}'::jsonb);`,
+			1,
+			map[string]string{"id": "uuid-1", "email": "a@b.com", "raw_app_meta_data": `{"p":"email"}`},
+		},
+		{
+			"empty_statement",
+			``,
+			0,
+			nil,
+		},
+		{
+			"missing_columns_less_vals_than_cols",
+			`INSERT INTO auth.users (id, email, phone) VALUES ('uuid-1', 'a@b.com');`,
+			0, // len(vals) < len(columns)
+			nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			users := parseInsertIntoAuthUsers(tt.stmt)
+			if len(users) != tt.wantCount {
+				t.Fatalf("expected %d users, got %d", tt.wantCount, len(users))
+			}
+			if tt.wantFirst != nil && len(users) > 0 {
+				u := users[0]
+				if v, ok := tt.wantFirst["id"]; ok && u.id != v {
+					t.Errorf("id: got %q, want %q", u.id, v)
+				}
+				if v, ok := tt.wantFirst["email"]; ok && u.email != v {
+					t.Errorf("email: got %q, want %q", u.email, v)
+				}
+				if v, ok := tt.wantFirst["encrypted_password"]; ok && u.encryptedPassword != v {
+					t.Errorf("encrypted_password: got %q, want %q", u.encryptedPassword, v)
+				}
+				if v, ok := tt.wantFirst["raw_app_meta_data"]; ok && u.rawAppMetaData != v {
+					t.Errorf("raw_app_meta_data: got %q, want %q", u.rawAppMetaData, v)
+				}
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// splitValueGroups
+// ---------------------------------------------------------------------------
+
+func TestSplitValueGroups(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		wantCount int
+	}{
+		{"single_group", "('a', 'b')", 1},
+		{"multi_groups", "('a', 'b'), ('c', 'd')", 2},
+		{"nested_parens", "('fn(1,2)', 'b'), ('c', 'd')", 2},
+		{"quoted_commas", "('a,b', 'c'), ('d', 'e')", 2},
+		{"escaped_quotes", "('it''s', 'ok'), ('x', 'y')", 2},
+		{"empty_string", "", 0},
+		{"no_parens", "hello world", 0},
+		{"three_groups", "('1'), ('2'), ('3')", 3},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			groups := splitValueGroups(tt.input)
+			if len(groups) != tt.wantCount {
+				t.Errorf("expected %d groups, got %d: %v", tt.wantCount, len(groups), groups)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// splitSQLValues
+// ---------------------------------------------------------------------------
+
+func TestSplitSQLValues(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		wantCount int
+		wantFirst string
+	}{
+		{"standard", "'a', 'b', 'c'", 3, "'a'"},
+		{"quoted_with_commas", "'a,b', 'c'", 2, "'a,b'"},
+		{"null_value", "'a', NULL, 'c'", 3, "'a'"},
+		{"nested_parens", "fn(1,2), 'b'", 2, "fn(1,2)"},
+		{"type_casts", "'val'::uuid, 'json'::jsonb", 2, "'val'::uuid"},
+		{"single_value", "'only'", 1, "'only'"},
+		{"escaped_quotes", "'it''s', 'ok'", 2, "'it''s'"},
+		{"empty", "", 1, ""}, // one empty segment
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := splitSQLValues(tt.input)
+			if len(result) != tt.wantCount {
+				t.Fatalf("expected %d values, got %d: %v", tt.wantCount, len(result), result)
+			}
+			if tt.wantFirst != "" && strings.TrimSpace(result[0]) != tt.wantFirst {
+				t.Errorf("first value: got %q, want %q", strings.TrimSpace(result[0]), tt.wantFirst)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// unquoteSQLValue
+// ---------------------------------------------------------------------------
+
+func TestUnquoteSQLValue(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{"quoted_string", "'hello'", "hello"},
+		{"null_value", "NULL", ""},
+		{"true_value", "TRUE", "true"},
+		{"false_value", "FALSE", "false"},
+		{"t_value", "T", "true"},
+		{"f_value", "F", "false"},
+		{"uuid_cast", "'abc-123'::uuid", "abc-123"},
+		{"jsonb_cast", "'{\"key\":\"val\"}'::jsonb", `{"key":"val"}`},
+		{"empty_string", "", ""},
+		{"bare_number", "42", "42"},
+		{"escaped_quotes", "'it''s a test'", "it's a test"},
+		{"empty_quotes", "''", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := unquoteSQLValue(tt.input)
+			if got != tt.expected {
+				t.Errorf("unquoteSQLValue(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// analyzeContent
+// ---------------------------------------------------------------------------
+
+func TestAnalyzeContent(t *testing.T) {
+	svc := NewImportService(nil, "postgresql://localhost/test")
+
+	t.Run("supabase_dump", func(t *testing.T) {
+		content := `CREATE SCHEMA IF NOT EXISTS auth;
+auth.users
+auth.sessions
+supabase_migrations
+supabase_admin
+supabase_auth_admin
+authenticator
+extensions.uuid-ossp
+pgsodium`
+		analysis := &DumpAnalysis{
+			SupabaseSchemas: []string{},
+			DetectedSignals: []string{},
+		}
+		svc.analyzeContent(content, analysis)
+		if !analysis.IsSupabaseDump {
+			t.Error("expected IsSupabaseDump true")
+		}
+		if !analysis.HasAuthUsers {
+			t.Error("expected HasAuthUsers true")
+		}
+		if !analysis.HasMigrations {
+			t.Error("expected HasMigrations true")
+		}
+		if len(analysis.DetectedSignals) == 0 {
+			t.Error("expected non-empty DetectedSignals")
+		}
+	})
+
+	t.Run("non_supabase", func(t *testing.T) {
+		content := "CREATE TABLE public.products (id int);\nINSERT INTO public.products VALUES (1);"
+		analysis := &DumpAnalysis{
+			SupabaseSchemas: []string{},
+			DetectedSignals: []string{},
+		}
+		svc.analyzeContent(content, analysis)
+		if analysis.IsSupabaseDump {
+			t.Error("expected IsSupabaseDump false")
+		}
+	})
+
+	t.Run("empty_content", func(t *testing.T) {
+		analysis := &DumpAnalysis{
+			SupabaseSchemas: []string{},
+			DetectedSignals: []string{},
+		}
+		svc.analyzeContent("", analysis)
+		if analysis.IsSupabaseDump {
+			t.Error("expected IsSupabaseDump false for empty content")
+		}
+		if analysis.HasAuthUsers {
+			t.Error("expected HasAuthUsers false for empty content")
+		}
+	})
+
+	t.Run("below_threshold", func(t *testing.T) {
+		// Only 2 signals (threshold is 3)
+		content := "supabase_admin\nsupabase_auth_admin"
+		analysis := &DumpAnalysis{
+			SupabaseSchemas: []string{},
+			DetectedSignals: []string{},
+		}
+		svc.analyzeContent(content, analysis)
+		if analysis.IsSupabaseDump {
+			t.Error("expected IsSupabaseDump false with only 2 signals")
+		}
+		if len(analysis.DetectedSignals) != 2 {
+			t.Errorf("expected 2 DetectedSignals, got %d", len(analysis.DetectedSignals))
+		}
+	})
+
+	t.Run("has_migrations_only", func(t *testing.T) {
+		content := "supabase_migrations\nCREATE TABLE public.stuff (id int);"
+		analysis := &DumpAnalysis{
+			SupabaseSchemas: []string{},
+			DetectedSignals: []string{},
+		}
+		svc.analyzeContent(content, analysis)
+		if analysis.IsSupabaseDump {
+			t.Error("expected IsSupabaseDump false with only 1 signal")
+		}
+		if !analysis.HasMigrations {
+			t.Error("expected HasMigrations true")
+		}
+	})
+}
+
 func TestSupabaseAuthUser_Fields(t *testing.T) {
 	u := supabaseAuthUser{
 		id:                "uuid-123",

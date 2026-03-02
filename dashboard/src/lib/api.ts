@@ -58,6 +58,8 @@ export const platformAuth = {
 export const projects = {
   list: (token: string, orgId?: string) =>
     api<Project[]>(`/platform/projects${orgId ? `?org_id=${orgId}` : ''}`, { token }),
+  get: (token: string, id: string) =>
+    api<Project>(`/platform/projects/${id}`, { token }),
   create: (token: string, name: string, orgId?: string) =>
     api<Project>("/platform/projects", {
       method: "POST",

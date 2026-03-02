@@ -37,14 +37,13 @@ export default function ProjectDetailPage({
 
   const load = useCallback(async () => {
     if (!token) return;
-    const { data, error } = await projectsApi.list(token);
+    const { data, error } = await projectsApi.get(token, id);
     if (error) {
       toast.error(error);
       setLoading(false);
       return;
     }
-    const found = data?.find((p) => p.id === id);
-    setProject(found || null);
+    setProject(data);
     setLoading(false);
   }, [token, id]);
 

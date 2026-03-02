@@ -264,6 +264,26 @@ func (s *ProjectService) ListProjects(ctx context.Context, orgID string) ([]Proj
 	return projects, nil
 }
 
+// GetProject returns a single project by ID for an organization, including the real jwt_secret.
+func (s *ProjectService) GetProject(ctx context.Context, orgID, projectID string) (*ProjectResponse, int, error) {
+	var p ProjectResponse
+	err := s.platformDB.QueryRow(ctx, `
+		SELECT id, name, db_name, region, anon_key, service_role_key, jwt_secret,
+			status, site_url, enable_signup, autoconfirm, password_min_length, created_at
+		FROM platform.projects
+		WHERE id = $1 AND org_id = $2 AND status = 'active'
+	`, projectID, orgID).Scan(&p.ID, &p.Name, &p.DBName, &p.Region,
+		&p.AnonKey, &p.ServiceRoleKey, &p.JWTSecret,
+		&p.Status, &p.SiteURL,
+		&p.Settings.EnableSignup, &p.Settings.Autoconfirm, &p.Settings.PasswordMinLength,
+		&p.CreatedAt)
+	if err != nil {
+		return nil, http.StatusNotFound, fmt.Errorf("project not found")
+	}
+	p.APIURL = s.siteURL
+	return &p, http.StatusOK, nil
+}
+
 // DeleteProject drops a database and marks the project as deleted.
 // orgID is used to verify the project belongs to the given organization.
 func (s *ProjectService) DeleteProject(ctx context.Context, orgID, projectID string) (int, error) {
