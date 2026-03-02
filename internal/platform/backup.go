@@ -49,6 +49,7 @@ type SaveBackupSettingsRequest struct {
 	RetentionDays    int      `json:"retention_days,omitempty"`
 	ProjectIDs       []string `json:"project_ids,omitempty"` // empty = all projects
 	PlatformPassword string   `json:"platform_password"`
+	OrgID            string   `json:"org_id,omitempty"`
 }
 
 // BackupSettingsResponse is the public-facing backup settings (no decrypted keys).
@@ -81,6 +82,7 @@ type BackupHistoryResponse struct {
 type backupSettingsInternal struct {
 	ID                   string
 	UserID               string
+	OrgID                string
 	S3Endpoint           string
 	S3Region             string
 	S3Bucket             string
@@ -97,7 +99,8 @@ type backupSettingsInternal struct {
 
 // SaveSettings validates the user's platform password, encrypts S3 keys with the
 // server-level backup encryption key, and upserts backup settings.
-func (s *BackupService) SaveSettings(ctx context.Context, userID string, req SaveBackupSettingsRequest) (*BackupSettingsResponse, int, error) {
+// orgID determines which org the settings belong to.
+func (s *BackupService) SaveSettings(ctx context.Context, userID, orgID string, req SaveBackupSettingsRequest) (*BackupSettingsResponse, int, error) {
 	if req.PlatformPassword == "" {
 		return nil, http.StatusBadRequest, fmt.Errorf("platform_password is required")
 	}
@@ -157,15 +160,16 @@ func (s *BackupService) SaveSettings(ctx context.Context, userID string, req Sav
 		projectIDs = []string{}
 	}
 
-	// UPSERT
+	// UPSERT keyed on org_id (with fallback to user_id for backward compat)
 	var id string
 	err = s.db.QueryRow(ctx, `
 		INSERT INTO platform.backup_settings (
-			user_id, s3_endpoint, s3_region, s3_bucket,
+			user_id, org_id, s3_endpoint, s3_region, s3_bucket,
 			s3_access_key_encrypted, s3_secret_key_encrypted,
 			s3_path_prefix, schedule, retention_days, project_ids, enabled
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE)
+		) VALUES ($1, $11, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE)
 		ON CONFLICT (user_id) DO UPDATE SET
+			org_id = EXCLUDED.org_id,
 			s3_endpoint = EXCLUDED.s3_endpoint,
 			s3_region = EXCLUDED.s3_region,
 			s3_bucket = EXCLUDED.s3_bucket,
@@ -180,7 +184,7 @@ func (s *BackupService) SaveSettings(ctx context.Context, userID string, req Sav
 		RETURNING id
 	`, userID, req.S3Endpoint, region, req.S3Bucket,
 		accessKeyEnc, secretKeyEnc,
-		req.S3PathPrefix, schedule, retentionDays, projectIDs,
+		req.S3PathPrefix, schedule, retentionDays, projectIDs, orgID,
 	).Scan(&id)
 	if err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("upsert backup settings: %w", err)
@@ -199,15 +203,15 @@ func (s *BackupService) SaveSettings(ctx context.Context, userID string, req Sav
 	}, http.StatusOK, nil
 }
 
-// GetSettings returns the user's backup settings (without decrypted keys).
-func (s *BackupService) GetSettings(ctx context.Context, userID string) (*BackupSettingsResponse, int, error) {
+// GetSettings returns backup settings for an org (without decrypted keys).
+func (s *BackupService) GetSettings(ctx context.Context, orgID string) (*BackupSettingsResponse, int, error) {
 	var resp BackupSettingsResponse
 	err := s.db.QueryRow(ctx, `
 		SELECT id, s3_endpoint, s3_region, s3_bucket, s3_path_prefix,
 			schedule, retention_days, project_ids, enabled
 		FROM platform.backup_settings
-		WHERE user_id = $1
-	`, userID).Scan(
+		WHERE org_id = $1
+	`, orgID).Scan(
 		&resp.ID, &resp.S3Endpoint, &resp.S3Region, &resp.S3Bucket,
 		&resp.S3PathPrefix, &resp.Schedule, &resp.RetentionDays, &resp.ProjectIDs, &resp.Enabled,
 	)
@@ -220,16 +224,17 @@ func (s *BackupService) GetSettings(ctx context.Context, userID string) (*Backup
 	return &resp, http.StatusOK, nil
 }
 
-// GetHistory returns the backup history for a user.
-func (s *BackupService) GetHistory(ctx context.Context, userID string) ([]BackupHistoryResponse, int, error) {
+// GetHistory returns the backup history for an org (via projects).
+func (s *BackupService) GetHistory(ctx context.Context, orgID string) ([]BackupHistoryResponse, int, error) {
 	rows, err := s.db.Query(ctx, `
-		SELECT id, project_id, db_name, s3_key, size_bytes,
-			status, error_message, started_at, completed_at
-		FROM platform.backup_history
-		WHERE user_id = $1
-		ORDER BY started_at DESC
+		SELECT bh.id, bh.project_id, bh.db_name, bh.s3_key, bh.size_bytes,
+			bh.status, bh.error_message, bh.started_at, bh.completed_at
+		FROM platform.backup_history bh
+		JOIN platform.projects p ON p.id = bh.project_id
+		WHERE p.org_id = $1
+		ORDER BY bh.started_at DESC
 		LIMIT 100
-	`, userID)
+	`, orgID)
 	if err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("query backup history: %w", err)
 	}
@@ -250,10 +255,10 @@ func (s *BackupService) GetHistory(ctx context.Context, userID string) ([]Backup
 	return history, http.StatusOK, nil
 }
 
-// RunBackupForUser runs backups for all active projects of a specific user.
+// RunBackupForOrg runs backups for all active projects of a specific org.
 // This is called from the manual "run now" endpoint.
-func (s *BackupService) RunBackupForUser(ctx context.Context, userID string) (int, error) {
-	settings, err := s.getSettingsInternal(ctx, userID)
+func (s *BackupService) RunBackupForOrg(ctx context.Context, userID, orgID string) (int, error) {
+	settings, err := s.getSettingsInternalByOrg(ctx, orgID)
 	if err != nil {
 		return http.StatusNotFound, fmt.Errorf("backup settings not found")
 	}
@@ -261,7 +266,7 @@ func (s *BackupService) RunBackupForUser(ctx context.Context, userID string) (in
 		return http.StatusBadRequest, fmt.Errorf("backups are disabled")
 	}
 
-	projects, err := s.getActiveProjects(ctx, userID, settings.ProjectIDs)
+	projects, err := s.getActiveProjectsByOrg(ctx, orgID, settings.ProjectIDs)
 	if err != nil {
 		return http.StatusInternalServerError, fmt.Errorf("get projects: %w", err)
 	}
@@ -275,10 +280,10 @@ func (s *BackupService) RunBackupForUser(ctx context.Context, userID string) (in
 	return http.StatusOK, nil
 }
 
-// RunBackupsForAllUsers is the cron entry point that runs backups for all enabled users.
+// RunBackupsForAllUsers is the cron entry point that runs backups for all enabled orgs.
 func (s *BackupService) RunBackupsForAllUsers(ctx context.Context) error {
 	rows, err := s.db.Query(ctx, `
-		SELECT id, user_id, s3_endpoint, s3_region, s3_bucket,
+		SELECT id, user_id, COALESCE(org_id::text, ''), s3_endpoint, s3_region, s3_bucket,
 			s3_access_key_encrypted, s3_secret_key_encrypted,
 			s3_path_prefix, schedule, retention_days, project_ids, enabled
 		FROM platform.backup_settings
@@ -292,7 +297,7 @@ func (s *BackupService) RunBackupsForAllUsers(ctx context.Context) error {
 	var allSettings []backupSettingsInternal
 	for rows.Next() {
 		var bs backupSettingsInternal
-		if err := rows.Scan(&bs.ID, &bs.UserID, &bs.S3Endpoint, &bs.S3Region,
+		if err := rows.Scan(&bs.ID, &bs.UserID, &bs.OrgID, &bs.S3Endpoint, &bs.S3Region,
 			&bs.S3Bucket, &bs.S3AccessKeyEncrypted, &bs.S3SecretKeyEncrypted,
 			&bs.S3PathPrefix, &bs.Schedule, &bs.RetentionDays, &bs.ProjectIDs, &bs.Enabled); err != nil {
 			return fmt.Errorf("scan backup settings: %w", err)
@@ -305,9 +310,16 @@ func (s *BackupService) RunBackupsForAllUsers(ctx context.Context) error {
 
 	now := time.Now().UTC()
 	for _, settings := range allSettings {
-		projects, err := s.getActiveProjects(ctx, settings.UserID, settings.ProjectIDs)
+		var projects []projectInfo
+		var err error
+		if settings.OrgID != "" {
+			projects, err = s.getActiveProjectsByOrg(ctx, settings.OrgID, settings.ProjectIDs)
+		} else {
+			// Backward compat: fall back to user-scoped lookup
+			projects, err = s.getActiveProjects(ctx, settings.UserID, settings.ProjectIDs)
+		}
 		if err != nil {
-			slog.Error("Backup: failed to get projects", "user_id", settings.UserID, "error", err)
+			slog.Error("Backup: failed to get projects", "user_id", settings.UserID, "org_id", settings.OrgID, "error", err)
 			continue
 		}
 
@@ -321,6 +333,300 @@ func (s *BackupService) RunBackupsForAllUsers(ctx context.Context) error {
 	return nil
 }
 
+// --- Request types for new features ---
+
+// TestS3ConnectionRequest is the request body for testing S3 connectivity.
+type TestS3ConnectionRequest struct {
+	S3Endpoint  string `json:"s3_endpoint"`
+	S3Region    string `json:"s3_region"`
+	S3Bucket    string `json:"s3_bucket"`
+	S3AccessKey string `json:"s3_access_key"`
+	S3SecretKey string `json:"s3_secret_key"`
+}
+
+// ToggleBackupRequest is the request body for enabling/disabling backups.
+type ToggleBackupRequest struct {
+	Enabled          bool   `json:"enabled"`
+	PlatformPassword string `json:"platform_password"`
+}
+
+// RestoreBackupRequest is the request body for restoring a backup.
+type RestoreBackupRequest struct {
+	PlatformPassword string `json:"platform_password"`
+}
+
+// TestS3Connection creates a temp S3 client with the provided (unencrypted) credentials
+// and runs HeadBucket to verify connectivity.
+func (s *BackupService) TestS3Connection(ctx context.Context, req TestS3ConnectionRequest) (int, error) {
+	if req.S3Endpoint == "" {
+		return http.StatusBadRequest, fmt.Errorf("s3_endpoint is required")
+	}
+	if req.S3Bucket == "" {
+		return http.StatusBadRequest, fmt.Errorf("s3_bucket is required")
+	}
+	if req.S3AccessKey == "" {
+		return http.StatusBadRequest, fmt.Errorf("s3_access_key is required")
+	}
+	if req.S3SecretKey == "" {
+		return http.StatusBadRequest, fmt.Errorf("s3_secret_key is required")
+	}
+
+	region := req.S3Region
+	if region == "" {
+		region = "us-east-1"
+	}
+
+	cfg, err := awsconfig.LoadDefaultConfig(ctx,
+		awsconfig.WithRegion(region),
+		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(req.S3AccessKey, req.S3SecretKey, "")),
+	)
+	if err != nil {
+		return http.StatusInternalServerError, fmt.Errorf("load AWS config: %w", err)
+	}
+
+	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		if req.S3Endpoint != "" {
+			o.BaseEndpoint = aws.String(req.S3Endpoint)
+			o.UsePathStyle = true
+		}
+	})
+
+	_, err = client.HeadBucket(ctx, &s3.HeadBucketInput{
+		Bucket: aws.String(req.S3Bucket),
+	})
+	if err != nil {
+		return http.StatusBadRequest, fmt.Errorf("S3 connection failed: %w", err)
+	}
+
+	return http.StatusOK, nil
+}
+
+// ToggleEnabled enables or disables backups after password verification.
+func (s *BackupService) ToggleEnabled(ctx context.Context, userID string, req ToggleBackupRequest) (*BackupSettingsResponse, int, error) {
+	if req.PlatformPassword == "" {
+		return nil, http.StatusBadRequest, fmt.Errorf("platform_password is required")
+	}
+
+	// Verify password
+	var passwordHash string
+	err := s.db.QueryRow(ctx, `SELECT password_hash FROM platform.users WHERE id = $1`, userID).Scan(&passwordHash)
+	if err != nil {
+		return nil, http.StatusNotFound, fmt.Errorf("user not found")
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.PlatformPassword)); err != nil {
+		return nil, http.StatusUnauthorized, fmt.Errorf("invalid password")
+	}
+
+	// Update enabled flag
+	var resp BackupSettingsResponse
+	err = s.db.QueryRow(ctx, `
+		UPDATE platform.backup_settings
+		SET enabled = $1, updated_at = NOW()
+		WHERE user_id = $2
+		RETURNING id, s3_endpoint, s3_region, s3_bucket, s3_path_prefix,
+			schedule, retention_days, project_ids, enabled
+	`, req.Enabled, userID).Scan(
+		&resp.ID, &resp.S3Endpoint, &resp.S3Region, &resp.S3Bucket,
+		&resp.S3PathPrefix, &resp.Schedule, &resp.RetentionDays, &resp.ProjectIDs, &resp.Enabled,
+	)
+	if err != nil {
+		return nil, http.StatusNotFound, fmt.Errorf("backup settings not found")
+	}
+	if resp.ProjectIDs == nil {
+		resp.ProjectIDs = []string{}
+	}
+	return &resp, http.StatusOK, nil
+}
+
+// ExportDatabase runs pg_dump in the requested format and returns a reader + filename.
+func (s *BackupService) ExportDatabase(ctx context.Context, dbName, format string) (io.ReadCloser, string, error) {
+	reader, err := s.dumpDatabase(ctx, dbName, format)
+	if err != nil {
+		return nil, "", err
+	}
+
+	now := time.Now().UTC()
+	ext := ".dump"
+	if format == "plain" || format == "sql" {
+		ext = ".sql"
+	}
+	filename := fmt.Sprintf("%s_%s%s", dbName, now.Format("2006-01-02T15-04-05Z"), ext)
+
+	return reader, filename, nil
+}
+
+// GetProjectDBName returns the db_name for an active project.
+func (s *BackupService) GetProjectDBName(ctx context.Context, projectID string) (string, error) {
+	var dbName string
+	err := s.db.QueryRow(ctx, `
+		SELECT db_name FROM platform.projects WHERE id = $1 AND status = 'active'
+	`, projectID).Scan(&dbName)
+	if err != nil {
+		return "", fmt.Errorf("project not found or not active")
+	}
+	return dbName, nil
+}
+
+// RestoreBackup downloads a backup from S3 and restores it to the project database.
+// It returns the import task ID, HTTP status, and any error.
+func (s *BackupService) RestoreBackup(ctx context.Context, userID string, historyID int64, pw string) (int64, int, error) {
+	if pw == "" {
+		return 0, http.StatusBadRequest, fmt.Errorf("platform_password is required")
+	}
+
+	// Verify password
+	var passwordHash string
+	err := s.db.QueryRow(ctx, `SELECT password_hash FROM platform.users WHERE id = $1`, userID).Scan(&passwordHash)
+	if err != nil {
+		return 0, http.StatusNotFound, fmt.Errorf("user not found")
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(pw)); err != nil {
+		return 0, http.StatusUnauthorized, fmt.Errorf("invalid password")
+	}
+
+	// Look up backup history record
+	var projectID, dbName, s3Key, status string
+	err = s.db.QueryRow(ctx, `
+		SELECT project_id, db_name, s3_key, status
+		FROM platform.backup_history
+		WHERE id = $1
+	`, historyID).Scan(&projectID, &dbName, &s3Key, &status)
+	if err != nil {
+		return 0, http.StatusNotFound, fmt.Errorf("backup history record not found")
+	}
+	if status != "completed" {
+		return 0, http.StatusBadRequest, fmt.Errorf("can only restore completed backups (status: %s)", status)
+	}
+
+	// Get S3 settings (need the user who owns this backup history to get credentials)
+	var backupUserID string
+	err = s.db.QueryRow(ctx, `SELECT user_id FROM platform.backup_history WHERE id = $1`, historyID).Scan(&backupUserID)
+	if err != nil {
+		return 0, http.StatusInternalServerError, fmt.Errorf("lookup backup user: %w", err)
+	}
+	settings, err := s.getSettingsInternal(ctx, backupUserID)
+	if err != nil {
+		return 0, http.StatusNotFound, fmt.Errorf("backup settings not found for restore")
+	}
+
+	// Build target database URL
+	u, err := url.Parse(s.databaseURL)
+	if err != nil {
+		return 0, http.StatusInternalServerError, fmt.Errorf("parse database URL: %w", err)
+	}
+	u.Path = "/" + dbName
+	dbURL := u.String()
+
+	// Create import task record for tracking
+	var taskID int64
+	err = s.db.QueryRow(ctx, `
+		INSERT INTO platform.import_tasks (user_id, project_id, db_name, file_name, file_size, format, status)
+		VALUES ($1, $2, $3, $4, 0, 'custom', 'running')
+		RETURNING id
+	`, userID, projectID, dbName, "restore:"+s3Key).Scan(&taskID)
+	if err != nil {
+		return 0, http.StatusInternalServerError, fmt.Errorf("create import task: %w", err)
+	}
+
+	// Launch restore in background
+	go s.executeRestore(taskID, dbURL, s3Key, settings)
+
+	return taskID, http.StatusAccepted, nil
+}
+
+// executeRestore downloads a backup from S3 to a temp file and runs pg_restore.
+func (s *BackupService) executeRestore(taskID int64, dbURL, s3Key string, settings *backupSettingsInternal) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
+	defer cancel()
+
+	// Download from S3
+	client, err := s.getS3Client(ctx, settings)
+	if err != nil {
+		s.markRestoreFailed(ctx, taskID, fmt.Sprintf("create S3 client: %v", err))
+		return
+	}
+
+	output, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(settings.S3Bucket),
+		Key:    aws.String(s3Key),
+	})
+	if err != nil {
+		s.markRestoreFailed(ctx, taskID, fmt.Sprintf("S3 GetObject: %v", err))
+		return
+	}
+	defer output.Body.Close()
+
+	// Write to temp file
+	tmpDir := os.Getenv("IMPORT_TEMP_DIR")
+	if tmpDir == "" {
+		tmpDir = "/tmp/imports"
+	}
+	tmpFile, err := os.CreateTemp(tmpDir, "restore-*.dump")
+	if err != nil {
+		s.markRestoreFailed(ctx, taskID, fmt.Sprintf("create temp file: %v", err))
+		return
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := io.Copy(tmpFile, output.Body); err != nil {
+		tmpFile.Close()
+		s.markRestoreFailed(ctx, taskID, fmt.Sprintf("download backup: %v", err))
+		return
+	}
+	tmpFile.Close()
+
+	// Run pg_restore
+	host, port, user, password, dbName, err := splitDBURL(dbURL)
+	if err != nil {
+		s.markRestoreFailed(ctx, taskID, fmt.Sprintf("parse DB URL: %v", err))
+		return
+	}
+
+	cmd := exec.CommandContext(ctx, "pg_restore",
+		"--no-owner",
+		"--no-acl",
+		"--clean",
+		"--if-exists",
+		"--host="+host, "--port="+port, "--username="+user, "--dbname="+dbName,
+		tmpFile.Name(),
+	)
+	cmd.Env = append(os.Environ(), "PGPASSWORD="+password)
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		outStr := string(out)
+		if isOnlyWarnings(outStr) {
+			slog.Warn("pg_restore (restore) completed with warnings", "task_id", taskID, "output", outStr)
+		} else {
+			s.markRestoreFailed(ctx, taskID, fmt.Sprintf("pg_restore: %s", outStr))
+			return
+		}
+	}
+
+	tableCount := countRestoredTables(ctx, dbURL)
+
+	if _, err := s.db.Exec(ctx, `
+		UPDATE platform.import_tasks
+		SET status = 'completed', tables_imported = $1, completed_at = NOW()
+		WHERE id = $2
+	`, tableCount, taskID); err != nil {
+		slog.Error("failed to mark restore as completed", "task_id", taskID, "error", err)
+	}
+
+	slog.Info("Restore completed", "task_id", taskID, "tables", tableCount)
+}
+
+func (s *BackupService) markRestoreFailed(ctx context.Context, taskID int64, errMsg string) {
+	slog.Error("Restore failed", "task_id", taskID, "error", errMsg)
+	if _, err := s.db.Exec(ctx, `
+		UPDATE platform.import_tasks
+		SET status = 'failed', error_message = $1, completed_at = NOW()
+		WHERE id = $2
+	`, errMsg, taskID); err != nil {
+		slog.Error("failed to mark restore as failed", "task_id", taskID, "error", err)
+	}
+}
+
 // --- Internal helpers ---
 
 type projectInfo struct {
@@ -331,12 +637,32 @@ type projectInfo struct {
 func (s *BackupService) getSettingsInternal(ctx context.Context, userID string) (*backupSettingsInternal, error) {
 	var bs backupSettingsInternal
 	err := s.db.QueryRow(ctx, `
-		SELECT id, user_id, s3_endpoint, s3_region, s3_bucket,
+		SELECT id, user_id, COALESCE(org_id::text, ''), s3_endpoint, s3_region, s3_bucket,
 			s3_access_key_encrypted, s3_secret_key_encrypted,
 			s3_path_prefix, schedule, retention_days, project_ids, enabled
 		FROM platform.backup_settings
 		WHERE user_id = $1
-	`, userID).Scan(&bs.ID, &bs.UserID, &bs.S3Endpoint, &bs.S3Region,
+	`, userID).Scan(&bs.ID, &bs.UserID, &bs.OrgID, &bs.S3Endpoint, &bs.S3Region,
+		&bs.S3Bucket, &bs.S3AccessKeyEncrypted, &bs.S3SecretKeyEncrypted,
+		&bs.S3PathPrefix, &bs.Schedule, &bs.RetentionDays, &bs.ProjectIDs, &bs.Enabled)
+	if err != nil {
+		return nil, err
+	}
+	if bs.ProjectIDs == nil {
+		bs.ProjectIDs = []string{}
+	}
+	return &bs, nil
+}
+
+func (s *BackupService) getSettingsInternalByOrg(ctx context.Context, orgID string) (*backupSettingsInternal, error) {
+	var bs backupSettingsInternal
+	err := s.db.QueryRow(ctx, `
+		SELECT id, user_id, COALESCE(org_id::text, ''), s3_endpoint, s3_region, s3_bucket,
+			s3_access_key_encrypted, s3_secret_key_encrypted,
+			s3_path_prefix, schedule, retention_days, project_ids, enabled
+		FROM platform.backup_settings
+		WHERE org_id = $1
+	`, orgID).Scan(&bs.ID, &bs.UserID, &bs.OrgID, &bs.S3Endpoint, &bs.S3Region,
 		&bs.S3Bucket, &bs.S3AccessKeyEncrypted, &bs.S3SecretKeyEncrypted,
 		&bs.S3PathPrefix, &bs.Schedule, &bs.RetentionDays, &bs.ProjectIDs, &bs.Enabled)
 	if err != nil {
@@ -360,6 +686,37 @@ func (s *BackupService) getActiveProjects(ctx context.Context, userID string, fi
 		query = `SELECT id, db_name FROM platform.projects
 			WHERE user_id = $1 AND status = 'active'`
 		args = []interface{}{userID}
+	}
+
+	rows, err := s.db.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var projects []projectInfo
+	for rows.Next() {
+		var p projectInfo
+		if err := rows.Scan(&p.id, &p.dbName); err != nil {
+			return nil, err
+		}
+		projects = append(projects, p)
+	}
+	return projects, nil
+}
+
+func (s *BackupService) getActiveProjectsByOrg(ctx context.Context, orgID string, filterIDs []string) ([]projectInfo, error) {
+	var query string
+	var args []interface{}
+
+	if len(filterIDs) > 0 {
+		query = `SELECT id, db_name FROM platform.projects
+			WHERE org_id = $1 AND status = 'active' AND id::text = ANY($2)`
+		args = []interface{}{orgID, filterIDs}
+	} else {
+		query = `SELECT id, db_name FROM platform.projects
+			WHERE org_id = $1 AND status = 'active'`
+		args = []interface{}{orgID}
 	}
 
 	rows, err := s.db.Query(ctx, query, args...)
@@ -431,7 +788,7 @@ func (s *BackupService) runSingleBackup(ctx context.Context, userID, projectID, 
 	}
 
 	// Run pg_dump
-	reader, err := s.dumpDatabase(ctx, dbName)
+	reader, err := s.dumpDatabase(ctx, dbName, "custom")
 	if err != nil {
 		if ctx.Err() != nil {
 			s.markBackupCancelled(ctx, historyID)
@@ -509,7 +866,8 @@ func (s *BackupService) deleteS3Object(ctx context.Context, settings *backupSett
 }
 
 // dumpDatabase runs pg_dump for a specific database and returns a reader of the output.
-func (s *BackupService) dumpDatabase(ctx context.Context, dbName string) (io.ReadCloser, error) {
+// format: "custom" → --format=custom (.dump), "plain"/"sql" → --format=plain (.sql)
+func (s *BackupService) dumpDatabase(ctx context.Context, dbName, format string) (io.ReadCloser, error) {
 	u, err := url.Parse(s.databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse database URL: %w", err)
@@ -524,8 +882,13 @@ func (s *BackupService) dumpDatabase(ctx context.Context, dbName string) (io.Rea
 	user := u.User.Username()
 	password, _ := u.User.Password()
 
+	pgFormat := "custom"
+	if format == "plain" || format == "sql" {
+		pgFormat = "plain"
+	}
+
 	cmd := exec.CommandContext(ctx, "pg_dump",
-		"--format=custom",
+		"--format="+pgFormat,
 		"--no-owner",
 		"--no-acl",
 		"--host="+host, "--port="+port, "--username="+user, "--dbname="+dbName,

@@ -2,12 +2,15 @@
 
 import { useEffect, useState, useCallback } from "react";
 import { useAuth } from "@/lib/auth-context";
+import { useOrg } from "@/lib/org-context";
 import {
   backups as backupsApi,
+  imports as importsApi,
   projects as projectsApi,
   type BackupSettings,
   type BackupHistoryItem,
   type Project,
+  type ImportTask,
 } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import {
@@ -20,6 +23,7 @@ import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Switch } from "@/components/ui/switch";
 import {
   Select,
   SelectContent,
@@ -27,6 +31,16 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import {
   Table,
   TableBody,
@@ -37,7 +51,6 @@ import {
 } from "@/components/ui/table";
 import { toast } from "sonner";
 import {
-  HardDrive,
   Loader2,
   Play,
   Save,
@@ -45,16 +58,32 @@ import {
   CheckCircle2,
   XCircle,
   AlertCircle,
+  RotateCcw,
+  Plug,
 } from "lucide-react";
 
 export default function BackupsPage() {
   const { token } = useAuth();
+  const { activeOrg } = useOrg();
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [runningNow, setRunningNow] = useState(false);
+  const [testingConnection, setTestingConnection] = useState(false);
   const [settings, setSettings] = useState<BackupSettings | null>(null);
   const [history, setHistory] = useState<BackupHistoryItem[]>([]);
   const [allProjects, setAllProjects] = useState<Project[]>([]);
+
+  // Restore dialog
+  const [restoreDialogOpen, setRestoreDialogOpen] = useState(false);
+  const [restoreHistoryId, setRestoreHistoryId] = useState<number | null>(null);
+  const [restorePassword, setRestorePassword] = useState("");
+  const [restoring, setRestoring] = useState(false);
+
+  // Toggle dialog
+  const [toggleDialogOpen, setToggleDialogOpen] = useState(false);
+  const [toggleTarget, setToggleTarget] = useState(false);
+  const [togglePassword, setTogglePassword] = useState("");
+  const [toggling, setToggling] = useState(false);
 
   // Form state
   const [s3Endpoint, setS3Endpoint] = useState("");
@@ -68,13 +97,15 @@ export default function BackupsPage() {
   const [selectedProjectIds, setSelectedProjectIds] = useState<string[]>([]);
   const [platformPassword, setPlatformPassword] = useState("");
 
+  const orgId = activeOrg?.id;
+
   const load = useCallback(async () => {
     if (!token) return;
 
     const [settingsRes, historyRes, projectsRes] = await Promise.all([
-      backupsApi.getSettings(token),
-      backupsApi.getHistory(token),
-      projectsApi.list(token),
+      backupsApi.getSettings(token, orgId),
+      backupsApi.getHistory(token, orgId),
+      projectsApi.list(token, orgId),
     ]);
 
     if (settingsRes.data) {
@@ -87,10 +118,14 @@ export default function BackupsPage() {
       setSchedule(s.schedule);
       setRetentionDays(s.retention_days);
       setSelectedProjectIds(s.project_ids || []);
+    } else {
+      setSettings(null);
     }
 
     if (historyRes.data) {
       setHistory(historyRes.data);
+    } else {
+      setHistory([]);
     }
 
     if (projectsRes.data) {
@@ -98,9 +133,10 @@ export default function BackupsPage() {
     }
 
     setLoading(false);
-  }, [token]);
+  }, [token, orgId]);
 
   useEffect(() => {
+    setLoading(true);
     load();
   }, [load]);
 
@@ -120,6 +156,7 @@ export default function BackupsPage() {
       retention_days: retentionDays,
       project_ids: selectedProjectIds,
       platform_password: platformPassword,
+      org_id: orgId,
     });
     setSaving(false);
 
@@ -137,14 +174,68 @@ export default function BackupsPage() {
   const handleRunNow = async () => {
     if (!token) return;
     setRunningNow(true);
-    const { error } = await backupsApi.runNow(token);
+    const { error } = await backupsApi.runNow(token, orgId);
     setRunningNow(false);
 
     if (error) {
       toast.error(error);
     } else {
       toast.success("Backup started");
-      // Refresh history after a short delay
+      setTimeout(() => load(), 2000);
+    }
+  };
+
+  const handleTestConnection = async () => {
+    if (!token) return;
+    if (!s3Endpoint || !s3Bucket || !s3AccessKey || !s3SecretKey) {
+      toast.error("Fill in all S3 connection fields first");
+      return;
+    }
+    setTestingConnection(true);
+    const { error } = await backupsApi.testConnection(token, {
+      s3_endpoint: s3Endpoint,
+      s3_region: s3Region || "us-east-1",
+      s3_bucket: s3Bucket,
+      s3_access_key: s3AccessKey,
+      s3_secret_key: s3SecretKey,
+    });
+    setTestingConnection(false);
+
+    if (error) {
+      toast.error(`Connection failed: ${error}`);
+    } else {
+      toast.success("S3 connection successful");
+    }
+  };
+
+  const handleToggle = async () => {
+    if (!token || !togglePassword) return;
+    setToggling(true);
+    const { data, error } = await backupsApi.toggleEnabled(token, toggleTarget, togglePassword);
+    setToggling(false);
+
+    if (error) {
+      toast.error(error);
+    } else if (data) {
+      setSettings(data);
+      toast.success(toggleTarget ? "Backups enabled" : "Backups disabled");
+      setToggleDialogOpen(false);
+      setTogglePassword("");
+    }
+  };
+
+  const handleRestore = async () => {
+    if (!token || restoreHistoryId == null || !restorePassword) return;
+    setRestoring(true);
+    const { data, error } = await backupsApi.restoreBackup(token, restoreHistoryId, restorePassword);
+    setRestoring(false);
+
+    if (error) {
+      toast.error(error);
+    } else if (data) {
+      toast.success("Restore started. Check import history for progress.");
+      setRestoreDialogOpen(false);
+      setRestorePassword("");
       setTimeout(() => load(), 2000);
     }
   };
@@ -221,7 +312,7 @@ export default function BackupsPage() {
         {settings && (
           <Button
             onClick={handleRunNow}
-            disabled={runningNow}
+            disabled={runningNow || !settings.enabled}
             variant="outline"
           >
             {runningNow ? (
@@ -241,10 +332,18 @@ export default function BackupsPage() {
 
       {settings && (
         <div className="flex items-center gap-3">
-          <Badge variant="secondary" className="gap-1.5">
-            <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-            Enabled
-          </Badge>
+          <div className="flex items-center gap-2">
+            <Switch
+              checked={settings.enabled}
+              onCheckedChange={(checked) => {
+                setToggleTarget(checked);
+                setToggleDialogOpen(true);
+              }}
+            />
+            <span className="text-sm font-medium">
+              {settings.enabled ? "Enabled" : "Disabled"}
+            </span>
+          </div>
           <Badge variant="outline" className="gap-1.5">
             <Clock className="h-3 w-3" />
             {settings.schedule}
@@ -334,6 +433,27 @@ export default function BackupsPage() {
                     required={!settings}
                   />
                 </div>
+              </div>
+              <div className="flex justify-end">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={handleTestConnection}
+                  disabled={testingConnection}
+                >
+                  {testingConnection ? (
+                    <>
+                      <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
+                      Testing...
+                    </>
+                  ) : (
+                    <>
+                      <Plug className="mr-2 h-3.5 w-3.5" />
+                      Test Connection
+                    </>
+                  )}
+                </Button>
               </div>
             </CardContent>
           </Card>
@@ -430,7 +550,6 @@ export default function BackupsPage() {
                           checked={isSelected}
                           onCheckedChange={() => {
                             if (selectedProjectIds.length === 0) {
-                              // Switching from "all" to specific — select all except this one
                               setSelectedProjectIds(
                                 allProjects
                                   .filter((p) => p.id !== project.id)
@@ -526,6 +645,7 @@ export default function BackupsPage() {
                       <TableHead>Size</TableHead>
                       <TableHead>Started</TableHead>
                       <TableHead>Duration</TableHead>
+                      <TableHead></TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -562,6 +682,21 @@ export default function BackupsPage() {
                           <TableCell className="text-xs">
                             {duration != null ? `${duration}s` : "\u2014"}
                           </TableCell>
+                          <TableCell>
+                            {item.status === "completed" && (
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                onClick={() => {
+                                  setRestoreHistoryId(item.id);
+                                  setRestoreDialogOpen(true);
+                                }}
+                              >
+                                <RotateCcw className="mr-1.5 h-3.5 w-3.5" />
+                                Restore
+                              </Button>
+                            )}
+                          </TableCell>
                         </TableRow>
                       );
                     })}
@@ -572,6 +707,93 @@ export default function BackupsPage() {
           </div>
         </>
       )}
+
+      {/* Restore Confirmation Dialog */}
+      <AlertDialog open={restoreDialogOpen} onOpenChange={setRestoreDialogOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Restore Backup</AlertDialogTitle>
+            <AlertDialogDescription>
+              This will overwrite the current database with the backup data.
+              Enter your platform password to confirm.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <div className="space-y-2 py-2">
+            <Label htmlFor="restore-pw">Platform password</Label>
+            <Input
+              id="restore-pw"
+              type="password"
+              placeholder="Your platform password"
+              value={restorePassword}
+              onChange={(e) => setRestorePassword(e.target.value)}
+            />
+          </div>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={() => { setRestorePassword(""); setRestoreHistoryId(null); }}>
+              Cancel
+            </AlertDialogCancel>
+            <Button
+              onClick={handleRestore}
+              disabled={restoring || !restorePassword}
+              variant="destructive"
+            >
+              {restoring ? (
+                <>
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  Restoring...
+                </>
+              ) : (
+                "Restore"
+              )}
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Toggle Confirmation Dialog */}
+      <AlertDialog open={toggleDialogOpen} onOpenChange={setToggleDialogOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {toggleTarget ? "Enable Backups" : "Disable Backups"}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {toggleTarget
+                ? "Backups will resume on the configured schedule."
+                : "Backups will stop running. Your existing backup history will be preserved."}
+              {" "}Enter your platform password to confirm.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <div className="space-y-2 py-2">
+            <Label htmlFor="toggle-pw">Platform password</Label>
+            <Input
+              id="toggle-pw"
+              type="password"
+              placeholder="Your platform password"
+              value={togglePassword}
+              onChange={(e) => setTogglePassword(e.target.value)}
+            />
+          </div>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={() => setTogglePassword("")}>
+              Cancel
+            </AlertDialogCancel>
+            <Button
+              onClick={handleToggle}
+              disabled={toggling || !togglePassword}
+            >
+              {toggling ? (
+                <>
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  {toggleTarget ? "Enabling..." : "Disabling..."}
+                </>
+              ) : (
+                toggleTarget ? "Enable" : "Disable"
+              )}
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

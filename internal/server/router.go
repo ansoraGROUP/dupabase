@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	apiAuth "github.com/ansoraGROUP/dupabase/internal/api/auth"
 	apiRest "github.com/ansoraGROUP/dupabase/internal/api/rest"
@@ -211,6 +212,12 @@ func (s *Server) registerRoutes() {
 	s.mux.Handle("GET /platform/backups/settings", s.platformAuth.Middleware(http.HandlerFunc(s.handleGetBackupSettings)))
 	s.mux.Handle("GET /platform/backups/history", s.platformAuth.Middleware(http.HandlerFunc(s.handleGetBackupHistory)))
 	s.mux.Handle("POST /platform/backups/run", s.platformAuth.Middleware(http.HandlerFunc(s.handleRunBackupNow)))
+	s.mux.Handle("POST /platform/backups/test-connection", s.platformAuth.Middleware(maxBody(http.HandlerFunc(s.handleTestS3Connection), 1<<20)))
+	s.mux.Handle("PATCH /platform/backups/settings", s.platformAuth.Middleware(maxBody(http.HandlerFunc(s.handleToggleBackup), 1<<20)))
+	s.mux.Handle("POST /platform/backups/{historyId}/restore", s.platformAuth.Middleware(maxBody(http.HandlerFunc(s.handleRestoreBackup), 1<<20)))
+
+	// Export endpoint (require platform JWT + org developer role)
+	s.mux.Handle("GET /platform/projects/{id}/export", s.platformAuth.Middleware(http.HandlerFunc(s.handleExportDatabase)))
 
 	// Public: registration mode (for frontend to check)
 	s.mux.HandleFunc("GET /platform/auth/registration-mode", s.handleRegistrationMode)
@@ -906,20 +913,49 @@ func (s *Server) handleSaveBackupSettings(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	resp, status, err := s.backupService.SaveSettings(r.Context(), userID, req)
+	orgID, err := s.resolveBackupOrgID(r, userID, req.OrgID)
+	if err != nil {
+		dupaHTTP.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	role, err := s.orgService.CheckOrgRole(r.Context(), orgID, userID)
+	if err != nil {
+		dupaHTTP.WriteJSON(w, http.StatusForbidden, map[string]string{"error": "not a member of this organization"})
+		return
+	}
+	if !platform.HasMinRole(role, "admin") {
+		dupaHTTP.WriteJSON(w, http.StatusForbidden, map[string]string{"error": "admin access required"})
+		return
+	}
+
+	resp, status, err := s.backupService.SaveSettings(r.Context(), userID, orgID, req)
 	if err != nil {
 		dupaHTTP.WriteJSON(w, status, map[string]string{"error": err.Error()})
 		return
 	}
 
-	s.auditService.Log(r.Context(), &userID, "save_backup_settings", "backup", "", r, nil)
+	s.auditService.Log(r.Context(), &userID, "save_backup_settings", "backup", "", r, map[string]interface{}{"org_id": orgID})
 	dupaHTTP.WriteJSON(w, status, resp)
 }
 
 func (s *Server) handleGetBackupSettings(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.GetUserID(r)
+	orgID, err := s.resolveBackupOrgID(r, userID, r.URL.Query().Get("org_id"))
+	if err != nil {
+		dupaHTTP.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	role, err := s.orgService.CheckOrgRole(r.Context(), orgID, userID)
+	if err != nil {
+		dupaHTTP.WriteJSON(w, http.StatusForbidden, map[string]string{"error": "not a member of this organization"})
+		return
+	}
+	if !platform.HasMinRole(role, "viewer") {
+		dupaHTTP.WriteJSON(w, http.StatusForbidden, map[string]string{"error": "insufficient permissions"})
+		return
+	}
 
-	resp, status, err := s.backupService.GetSettings(r.Context(), userID)
+	resp, status, err := s.backupService.GetSettings(r.Context(), orgID)
 	if err != nil {
 		dupaHTTP.WriteJSON(w, status, map[string]string{"error": err.Error()})
 		return
@@ -930,8 +966,22 @@ func (s *Server) handleGetBackupSettings(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) handleGetBackupHistory(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.GetUserID(r)
+	orgID, err := s.resolveBackupOrgID(r, userID, r.URL.Query().Get("org_id"))
+	if err != nil {
+		dupaHTTP.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	role, err := s.orgService.CheckOrgRole(r.Context(), orgID, userID)
+	if err != nil {
+		dupaHTTP.WriteJSON(w, http.StatusForbidden, map[string]string{"error": "not a member of this organization"})
+		return
+	}
+	if !platform.HasMinRole(role, "viewer") {
+		dupaHTTP.WriteJSON(w, http.StatusForbidden, map[string]string{"error": "insufficient permissions"})
+		return
+	}
 
-	resp, status, err := s.backupService.GetHistory(r.Context(), userID)
+	resp, status, err := s.backupService.GetHistory(r.Context(), orgID)
 	if err != nil {
 		dupaHTTP.WriteJSON(w, status, map[string]string{"error": err.Error()})
 		return
@@ -942,15 +992,165 @@ func (s *Server) handleGetBackupHistory(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) handleRunBackupNow(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.GetUserID(r)
+	orgID, err := s.resolveBackupOrgID(r, userID, r.URL.Query().Get("org_id"))
+	if err != nil {
+		dupaHTTP.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	role, err := s.orgService.CheckOrgRole(r.Context(), orgID, userID)
+	if err != nil {
+		dupaHTTP.WriteJSON(w, http.StatusForbidden, map[string]string{"error": "not a member of this organization"})
+		return
+	}
+	if !platform.HasMinRole(role, "developer") {
+		dupaHTTP.WriteJSON(w, http.StatusForbidden, map[string]string{"error": "developer access required"})
+		return
+	}
 
-	status, err := s.backupService.RunBackupForUser(r.Context(), userID)
+	status, err := s.backupService.RunBackupForOrg(r.Context(), userID, orgID)
 	if err != nil {
 		dupaHTTP.WriteJSON(w, status, map[string]string{"error": err.Error()})
 		return
 	}
 
-	s.auditService.Log(r.Context(), &userID, "run_backup_now", "backup", "", r, nil)
+	s.auditService.Log(r.Context(), &userID, "run_backup_now", "backup", "", r, map[string]interface{}{"org_id": orgID})
 	dupaHTTP.WriteJSON(w, status, map[string]string{"status": "backup started"})
+}
+
+func (s *Server) handleTestS3Connection(w http.ResponseWriter, r *http.Request) {
+	var req platform.TestS3ConnectionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		dupaHTTP.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+
+	status, err := s.backupService.TestS3Connection(r.Context(), req)
+	if err != nil {
+		dupaHTTP.WriteJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+
+	dupaHTTP.WriteJSON(w, http.StatusOK, map[string]string{"status": "connected"})
+}
+
+func (s *Server) handleToggleBackup(w http.ResponseWriter, r *http.Request) {
+	userID := middleware.GetUserID(r)
+	var req platform.ToggleBackupRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		dupaHTTP.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+
+	resp, status, err := s.backupService.ToggleEnabled(r.Context(), userID, req)
+	if err != nil {
+		dupaHTTP.WriteJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+
+	action := "disable_backup"
+	if req.Enabled {
+		action = "enable_backup"
+	}
+	s.auditService.Log(r.Context(), &userID, action, "backup", "", r, nil)
+	dupaHTTP.WriteJSON(w, status, resp)
+}
+
+func (s *Server) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {
+	userID := middleware.GetUserID(r)
+	historyIDStr := r.PathValue("historyId")
+	historyID, err := strconv.ParseInt(historyIDStr, 10, 64)
+	if err != nil {
+		dupaHTTP.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid history ID"})
+		return
+	}
+
+	var req platform.RestoreBackupRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		dupaHTTP.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+
+	taskID, status, err := s.backupService.RestoreBackup(r.Context(), userID, historyID, req.PlatformPassword)
+	if err != nil {
+		dupaHTTP.WriteJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+
+	s.auditService.Log(r.Context(), &userID, "restore_backup", "backup", historyIDStr, r, nil)
+	dupaHTTP.WriteJSON(w, status, map[string]interface{}{"task_id": taskID, "status": "restoring"})
+}
+
+func (s *Server) handleExportDatabase(w http.ResponseWriter, r *http.Request) {
+	userID := middleware.GetUserID(r)
+	projectID := r.PathValue("id")
+	if !isValidUUID(projectID) {
+		dupaHTTP.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid project ID format"})
+		return
+	}
+
+	// Verify org membership (developer+)
+	orgID, err := s.getProjectOrgID(r.Context(), projectID)
+	if err != nil {
+		dupaHTTP.WriteJSON(w, http.StatusNotFound, map[string]string{"error": "project not found"})
+		return
+	}
+	role, err := s.orgService.CheckOrgRole(r.Context(), orgID, userID)
+	if err != nil {
+		dupaHTTP.WriteJSON(w, http.StatusForbidden, map[string]string{"error": "not a member of this organization"})
+		return
+	}
+	if !platform.HasMinRole(role, "developer") {
+		dupaHTTP.WriteJSON(w, http.StatusForbidden, map[string]string{"error": "developer access required"})
+		return
+	}
+
+	format := r.URL.Query().Get("format")
+	if format == "" {
+		format = "custom"
+	}
+	if format != "custom" && format != "sql" && format != "plain" {
+		dupaHTTP.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "format must be 'custom' or 'sql'"})
+		return
+	}
+
+	dbName, err := s.backupService.GetProjectDBName(r.Context(), projectID)
+	if err != nil {
+		dupaHTTP.WriteJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+
+	// Extend write deadline to 30 minutes for large exports
+	rc := http.NewResponseController(w)
+	if err := rc.SetWriteDeadline(time.Now().Add(30 * time.Minute)); err != nil {
+		slog.Warn("failed to extend write deadline", "error", err)
+	}
+
+	// Use a 30-minute context for the export
+	exportCtx, cancel := context.WithTimeout(r.Context(), 30*time.Minute)
+	defer cancel()
+
+	reader, filename, err := s.backupService.ExportDatabase(exportCtx, dbName, format)
+	if err != nil {
+		dupaHTTP.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("export failed: %v", err)})
+		return
+	}
+	defer reader.Close()
+
+	contentType := "application/octet-stream"
+	if format == "sql" || format == "plain" {
+		contentType = "application/sql"
+	}
+
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	w.Header().Set("Access-Control-Expose-Headers", "Content-Disposition")
+	w.WriteHeader(http.StatusOK)
+
+	if _, err := io.Copy(w, reader); err != nil {
+		slog.Error("export stream error", "project_id", projectID, "error", err)
+	}
+
+	s.auditService.Log(r.Context(), &userID, "export_database", "project", projectID, r, map[string]interface{}{"format": format})
 }
 
 // ---------- Import handlers ----------
@@ -2082,6 +2282,18 @@ func isValidUUID(s string) bool {
 // ---------- Helpers ----------
 
 // getProjectOrgID looks up the org_id for a project.
+// resolveBackupOrgID resolves the org_id for backup endpoints.
+// If orgID is provided in query/body, use it; otherwise fall back to personal org.
+func (s *Server) resolveBackupOrgID(r *http.Request, userID, orgID string) (string, error) {
+	if orgID != "" {
+		if !isValidUUID(orgID) {
+			return "", fmt.Errorf("invalid org_id format")
+		}
+		return orgID, nil
+	}
+	return s.orgService.GetPersonalOrgID(r.Context(), userID)
+}
+
 func (s *Server) getProjectOrgID(ctx context.Context, projectID string) (string, error) {
 	var orgID string
 	err := s.platformDB.QueryRow(ctx, `

@@ -16,12 +16,13 @@ import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { toast } from "sonner";
-import { ArrowLeft, BarChart3, Database, Globe, Key, Settings, Upload, TableProperties, Terminal, Users, ScrollText } from "lucide-react";
+import { ArrowLeft, BarChart3, Database, Download, Globe, Key, Settings, Upload, TableProperties, Terminal, Users, ScrollText } from "lucide-react";
 import Link from "next/link";
 import { SecretField } from "@/components/dashboard/secret-field";
 import { CopyButton } from "@/components/dashboard/copy-button";
 import { ImportDialog } from "@/components/dashboard/import-dialog";
 import { ImportHistory } from "@/components/dashboard/import-history";
+import { ExportSection } from "@/components/dashboard/export-section";
 
 export default function ProjectDetailPage({
   params,
@@ -204,6 +205,10 @@ const { data: todos } = await supabase
           <TabsTrigger value="import">
             <Upload className="mr-1.5 h-3.5 w-3.5" />
             Import
+          </TabsTrigger>
+          <TabsTrigger value="export">
+            <Download className="mr-1.5 h-3.5 w-3.5" />
+            Export
           </TabsTrigger>
         </TabsList>
 
@@ -401,6 +406,20 @@ const { data: todos } = await supabase
             </CardContent>
           </Card>
           <ImportHistory projectId={id} refreshKey={importRefreshKey} />
+        </TabsContent>
+
+        <TabsContent value="export" className="space-y-4 mt-4">
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">Database Export</CardTitle>
+              <CardDescription>
+                Download a full export of your project database as a .dump or .sql file.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <ExportSection projectId={id} />
+            </CardContent>
+          </Card>
         </TabsContent>
       </Tabs>
     </div>
